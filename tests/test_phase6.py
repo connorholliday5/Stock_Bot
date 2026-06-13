@@ -1,4 +1,3 @@
-
 """tests/test_phase6.py - scheduler wiring verification.
 
 Covers: job registration + triggers, DB-reconstruct account state, RiskManager
@@ -10,6 +9,7 @@ broker, and no network.
 """
 
 import types
+from typing import cast
 
 import pytest
 
@@ -33,9 +33,9 @@ class FakeRM:
 
 
 class FakePos:
-    def __init__(self, symbol, qty, entry_price, current_price=None):
+    def __init__(self, symbol, quantity, entry_price, current_price=None):
         self.symbol = symbol
-        self.qty = qty
+        self.quantity = quantity
         self.entry_price = entry_price
         self.current_price = current_price
 
