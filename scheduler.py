@@ -1,32 +1,32 @@
-"""scheduler.py - Phase 8: weekly reporting + daily heartbeat wired in.
+"""scheduler.py - production job wiring.
 
-APScheduler BackgroundScheduler. main.py owns the process loop and watchdog;
-this module builds and returns a configured scheduler with every job registered.
+APScheduler BackgroundScheduler. main.py owns the process; this module builds
+and returns a configured scheduler with every job registered, and exposes the
+job callables (JOBS) so the web UI can trigger any of them manually.
 
-Account state (equity / cash / open_positions) is reconstructed from the DB plus
-RiskManager (option b). Broker reads are deferred to the Phase 10 account layer.
-Everything funnels through the ADAPTER LAYER below, so swapping to broker or hybrid
-is a one-section change that never touches job logic.
+Capital: get_account_state() reads the LIVE Alpaca account (equity/cash) via
+execution.account when CAPITAL_SOURCE=broker - the money in the account is the
+capital base. It degrades to the DB-reconstructed NAV when the broker is
+unreachable or CAPITAL_SOURCE=static, so nothing here ever blocks on the API.
 
-Phase 7 additions (ADAPTER LAYER, jobs degrade to safe no-ops until Phase 2 wired):
-  - _load_feature_universe(), _load_ml_scorer(), _write_model_performance().
-  - sunday_stock_scan ML-blended scan; sunday_ml_retrain rolling retrain.
-
-Phase 8 additions (jobs only; reporting + alerts imported lazily so scheduler
-import stays bulletproof):
-  - weekly_performance_report: builds the weekly P&L report from the reporting
-    package, writes a static HTML file, sends a Telegram weekly summary.
-  - daily_heartbeat: one-line Telegram NAV/positions heartbeat. Best-effort.
+Rate-limit posture: the account read is TTL-cached (60s), stock data arrives
+in a handful of batched requests once a week (Sunday scan / Monday buys /
+Friday sells) plus one small mark-refresh batch per 30-min monitor tick, and
+crypto data uses Alpaca's keyless crypto endpoint every 4h - comfortably below
+Alpaca's ~200 req/min budget by design.
 
 Locked-strategy notes honored here:
   - Stocks: buy Mon 9:45 ET, sell Fri 3:45 ET, Sunday-night scan.
-  - Mid-week: stop-loss monitoring only. No over-managing (SPY breaker is log-only).
-  - Crypto: 24/7 4H cycle, BTC-only until 60 days profitable.
-  - Every trading job is gated on RiskManager.is_halted.
+  - Mid-week: stop-loss monitoring only. No over-managing.
+  - Crypto: 24/7 4H cycle through the SAME Alpaca account, BTC-only until
+    60 days profitable (BTC_ONLY flag below).
+  - Every entry job is gated on RiskManager.is_halted() AND the web UI pause
+    switch (runtime.bot_state). Pause never blocks risk-reducing jobs.
 """
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +36,9 @@ from config.settings import settings
 from database import db
 from risk.manager import RiskManager, MONTHLY_DRAWDOWN_HALT
 from execution.alpaca import StockExecutor
+from execution.account import get_account_snapshot
+from execution.alpaca_crypto import crypto_executor_from_settings, to_alpaca_symbol
+from runtime import bot_state
 from strategies import stock_scorer, stock_weekly, crypto_24h
 
 try:
@@ -45,11 +48,10 @@ except Exception:  # pragma: no cover - apscheduler present on target machine
     BackgroundScheduler = None
     CronTrigger = None
 
-MARKET_TZ = "America/New_York"  # ET; APScheduler resolves EST/EDT. Strategy says EST.
-STOCK_STOP_LOSS = 0.05
-CRYPTO_UNIVERSE = ["BTC/USDT"]  # BTC-only gate (TODO #3) until 60 days profitable.
+MARKET_TZ = "America/New_York"  # ET; APScheduler resolves EST/EDT.
+BTC_ONLY = True                 # locked strategy: BTC-only until 60 days profitable.
 
-# Phase 7: trained weekly stock model artifact (booster at MODEL_PATH + ".json",
+# Trained weekly stock model artifact (booster at MODEL_PATH + ".json",
 # metadata at MODEL_PATH + ".meta.json"). TrainedModel.save creates the dir.
 MODEL_PATH = "models/weekly_stock"
 
@@ -62,19 +64,7 @@ class AccountState:
 
 
 # ============================================================
-# ADAPTER LAYER - runtime account state (option b: DB reconstruct)
-# Swap to broker (a) or hybrid (c) here in Phase 10. Jobs below never change.
-#
-# Assumed db.py surface - rename these to match your Phase 1 accessors if needed:
-#   db.get_open_positions(asset_type)   -> list of Position(.symbol .quantity .entry_price .current_price)
-#   db.get_latest_scored_universe()     -> DataFrame persisted by the Sunday scan (or None)
-#   db.persist_scored_universe(df)      -> None
-#   db.get_feature_universe()           -> {ticker: DataFrame} Phase 2 validated features (or None)
-#   db.persist_model_performance(dict)  -> None  (writes a ModelPerformance row)
-#
-# RiskManager is assumed to self-load NAV/heat from the same DB on construction
-# (Phase 5: NAV = capital + closed-trade PnL + open marks). If yours must be fed
-# trades/positions, add that seed call inside build_risk_manager() only.
+# ACCOUNT / POSITION ADAPTERS
 # ============================================================
 
 def build_risk_manager() -> RiskManager:
@@ -82,72 +72,144 @@ def build_risk_manager() -> RiskManager:
                        monthly_halt=MONTHLY_DRAWDOWN_HALT)
 
 
+def _rm_halted(rm) -> bool:
+    """RiskManager.is_halted is a method; tolerate property-style fakes too."""
+    halted = rm.is_halted
+    return bool(halted() if callable(halted) else halted)
+
+
 def _open_positions(asset_type: str) -> list:
     return list(db.get_open_positions(asset_type))
 
 
-def _available_cash(rm: RiskManager, open_positions: list) -> float:
-    invested = 0.0
+def _position_dicts(positions) -> list[dict]:
+    """ORM Position rows -> the dict shape the strategy layer consumes.
+    Includes both 'symbol' and 'ticker' keys (stock signals read 'ticker',
+    crypto reads 'symbol')."""
+    out = []
+    for p in positions:
+        symbol = getattr(p, "symbol", None) or ""
+        out.append({
+            "symbol": symbol,
+            "ticker": symbol,
+            "quantity": float(getattr(p, "quantity", 0.0) or 0.0),
+            "entry_price": float(getattr(p, "entry_price", 0.0) or 0.0),
+            "current_price": getattr(p, "current_price", None),
+            "stop_loss": float(getattr(p, "stop_loss", 0.0) or 0.0),
+            "take_profit": float(getattr(p, "take_profit", 0.0) or 0.0),
+            "week_number": getattr(p, "week_number", None),
+        })
+    return out
+
+
+def _invested(open_positions: list) -> float:
+    total = 0.0
     for p in open_positions:
         mark = getattr(p, "current_price", None) or getattr(p, "entry_price", 0.0)
-        invested += float(getattr(p, "quantity", 0.0)) * float(mark or 0.0)
-    return max(0.0, float(rm.current_nav) - invested)
+        total += float(getattr(p, "quantity", 0.0) or 0.0) * float(mark or 0.0)
+    return total
 
 
 def get_account_state(rm: RiskManager, asset_type: str) -> AccountState:
+    """Equity/cash for sizing. Broker snapshot when configured; DB fallback."""
     positions = _open_positions(asset_type)
-    cash = _available_cash(rm, positions)
-    return AccountState(equity=float(rm.current_nav), cash=cash, open_positions=positions)
+    snap = get_account_snapshot(rm)
+    if snap.source == "broker":
+        return AccountState(equity=snap.equity, cash=max(0.0, snap.cash),
+                            open_positions=positions)
+    cash = max(0.0, snap.equity - _invested(positions))
+    return AccountState(equity=snap.equity, cash=cash, open_positions=positions)
 
 
-def _symbols(scored) -> list:
-    """Extract the symbol list from the persisted scored universe.
+# ============================================================
+# DATA ADAPTERS
+# ============================================================
 
-    The scorer's ranked frame uses a 'ticker' column; older/persisted shapes may
-    use 'symbol'. Accept either. Falls back to iterating a bare sequence.
-    """
-    if scored is None:
-        return []
-    cols = getattr(scored, "columns", None)
-    if cols is not None:
-        cols = list(cols)
-        for key in ("ticker", "symbol"):
-            if key in cols:
-                return list(scored[key])
+def _crypto_symbols() -> list[str]:
+    syms = list(getattr(settings, "crypto_universe", None) or ["BTC/USD"])
+    if getattr(settings, "crypto_exchange", "alpaca") == "alpaca":
+        syms = [to_alpaca_symbol(s) for s in syms]
+    # dedupe, preserve order (BTC/USDT and BTC/USD both map to BTC/USD)
+    return list(dict.fromkeys(syms))
+
+
+def _load_crypto_universe() -> dict:
+    """{symbol: 4H feature DataFrame}. Alpaca keyless data by default; the
+    ccxt/Binance public path when CRYPTO_EXCHANGE=binance. {} on failure."""
+    timeframe = getattr(settings, "crypto_timeframe", "4h")
+    if getattr(settings, "crypto_exchange", "alpaca") == "alpaca":
+        from data.alpaca_data import fetch_crypto_universe_alpaca
+        return fetch_crypto_universe_alpaca(symbols=_crypto_symbols(), timeframe=timeframe)
     try:
-        return list(scored)
-    except TypeError:
-        return []
+        from data.fetcher import fetch_crypto_universe
+        return fetch_crypto_universe(timeframe=timeframe) or {}
+    except Exception as exc:
+        logger.exception("_load_crypto_universe failed: {}", exc)
+        return {}
 
 
-# ----- Phase 7 ML adapter chokepoints -----------------------------------
+def _load_crypto_funding() -> dict:
+    """Perp funding haircut inputs. Alpaca is SPOT - no funding, so {} (the
+    strategy treats missing symbols as 0.0). Binance path fetches real rates."""
+    if getattr(settings, "crypto_exchange", "alpaca") == "alpaca":
+        return {}
+    try:
+        from data.fetcher import fetch_crypto_funding
+        return fetch_crypto_funding(_crypto_symbols()) or {}
+    except Exception as exc:
+        logger.warning("_load_crypto_funding failed ({}); proceeding with empty.", exc)
+        return {}
+
 
 def _load_feature_universe() -> dict:
-    """ADAPTER: Phase 2 validated feature universe as {ticker: DataFrame}.
+    """Stock scan universe {ticker: daily feature DataFrame}.
+    Polygon (full S&P 500) when a key is configured; otherwise Alpaca IEX
+    daily bars over the liquid large-cap seed list. {} on failure."""
+    if settings.polygon_api_key and not settings.polygon_api_key.startswith("your_"):
+        try:
+            universe = db.get_feature_universe()
+            if universe:
+                return dict(universe)
+            logger.warning("_load_feature_universe: Polygon path returned empty; trying Alpaca data")
+        except Exception as exc:
+            logger.exception("_load_feature_universe (polygon) failed: {}", exc)
+    try:
+        from data.alpaca_data import fetch_stock_universe_alpaca
+        return fetch_stock_universe_alpaca()
+    except Exception as exc:
+        logger.exception("_load_feature_universe (alpaca) failed: {}", exc)
+        return {}
 
-    This is the single place to wire the Phase 2 pipeline output that both the
-    scan and the retrain consume. Returns {} (safe no-op) until that accessor is
-    wired, so neither job can crash the scheduler thread before Phase 2 lands.
-    """
-    getter = getattr(db, "get_feature_universe", None)
-    if getter is None:
-        logger.warning("_load_feature_universe: no Phase 2 feature source wired. "
-                       "Returning empty universe (scan/retrain will no-op).")
+
+def _load_stock_frames(tickers: list[str], lookback_days: int = 90) -> dict:
+    """Small per-symbol daily frames for exits/marks - one batched request."""
+    if not tickers:
         return {}
     try:
-        universe = getter()
-        return dict(universe) if universe else {}
+        from data.alpaca_data import fetch_stock_universe_alpaca
+        return fetch_stock_universe_alpaca(lookback_days=lookback_days, tickers=tickers)
     except Exception as exc:
-        logger.exception("_load_feature_universe failed: {}", exc)
+        logger.warning("_load_stock_frames failed ({})", exc)
         return {}
 
 
-def _load_ml_scorer():
-    """ADAPTER: load the trained ML model for the composite blend.
+def _latest_closes(universe: dict) -> dict:
+    prices = {}
+    for symbol, df in (universe or {}).items():
+        try:
+            close = float(df["close"].iloc[-1])
+            if close > 0:
+                prices[symbol] = close
+        except Exception:
+            continue
+    return prices
 
-    Returns an ml.model.MLScorer, or None for pure rule scoring when no model is
-    on disk yet (e.g. before the first successful retrain) or load fails.
-    """
+
+# ----- ML adapter chokepoints -----------------------------------
+
+def _load_ml_scorer():
+    """Load the trained ML model for the composite blend, or None for pure
+    rule scoring (no model on disk yet / load failure)."""
     try:
         from ml.model import MLScorer
         booster = Path(MODEL_PATH).with_suffix(".json")
@@ -161,12 +223,7 @@ def _load_ml_scorer():
 
 
 def _write_model_performance(metrics: dict) -> None:
-    """ADAPTER: persist retrain metrics to the ModelPerformance table.
-
-    Best-effort; never raises into the retrain job. Assumes
-    db.persist_model_performance(dict). Wire to the real accessor if the name
-    differs. No schema changes (ModelPerformance already exists - Phase 1).
-    """
+    """Persist retrain metrics to ModelPerformance. Best-effort."""
     writer = getattr(db, "persist_model_performance", None)
     if writer is None:
         logger.info("_write_model_performance: no DB writer wired; metrics={}", metrics)
@@ -178,190 +235,287 @@ def _write_model_performance(metrics: dict) -> None:
 
 
 # ============================================================
+# JOB GUARD - records every run for the web UI, never raises
+# ============================================================
+
+# Jobs suppressed by the UI pause switch. Risk-REDUCING jobs are never
+# suppressed (midweek monitor, friday sells keep protecting open positions).
+ENTRY_JOBS = {"monday_stock_buys", "crypto_cycle"}
+
+
+def _guarded(job_id: str):
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if job_id in ENTRY_JOBS and bot_state.paused:
+                logger.warning("{}: skipped - bot paused from web UI", job_id)
+                run = bot_state.job_started(job_id)
+                bot_state.job_finished(run, ok=True, detail="skipped: paused")
+                return None
+            run = bot_state.job_started(job_id)
+            try:
+                result = fn(*args, **kwargs)
+                bot_state.job_finished(run, ok=True, detail=str(result or "")[:200])
+                return result
+            except Exception as exc:  # never let a job crash the scheduler thread
+                logger.exception("{} failed: {}", job_id, exc)
+                bot_state.job_finished(run, ok=False, detail=str(exc))
+                return None
+        wrapper.__wrapped_job_id__ = job_id
+        return wrapper
+    return decorate
+
+
+# ============================================================
 # JOBS
 # ============================================================
 
+@_guarded("sunday_stock_scan")
 def sunday_stock_scan() -> None:
-    logger.info("sunday_stock_scan: scoring S&P 500 universe")
-    try:
-        universe = _load_feature_universe()
-        if not universe:
-            logger.warning("sunday_stock_scan: empty feature universe. Skipping scan.")
-            return
-        ml_scorer = _load_ml_scorer()
-        ml_weight = stock_scorer.DEFAULT_ML_WEIGHT if ml_scorer is not None else 0.0
-        result = stock_scorer.score_universe(
-            universe,
-            ml_scorer=ml_scorer,
-            ml_weight=ml_weight,
-        )
-        ranked = getattr(result, "ranked", result)
-        db.persist_scored_universe(ranked)
-        n = 0 if ranked is None else len(ranked)
-        logger.info("sunday_stock_scan: persisted {} scored symbols (ml_blend={})",
-                    n, ml_scorer is not None)
-    except Exception as exc:  # never let a scan crash the scheduler thread
-        logger.exception("sunday_stock_scan failed: {}", exc)
+    logger.info("sunday_stock_scan: scoring stock universe")
+    universe = _load_feature_universe()
+    if not universe:
+        logger.warning("sunday_stock_scan: empty feature universe. Skipping scan.")
+        return
+    ml_scorer = _load_ml_scorer()
+    ml_weight = stock_scorer.DEFAULT_ML_WEIGHT if ml_scorer is not None else 0.0
+    result = stock_scorer.score_universe(universe, ml_scorer=ml_scorer, ml_weight=ml_weight)
+    ranked = getattr(result, "ranked", result)
+    db.persist_scored_universe(ranked)
+    n = 0 if ranked is None else len(ranked)
+    logger.info("sunday_stock_scan: persisted {} scored symbols (ml_blend={})",
+                n, ml_scorer is not None)
+    return f"scored={n}"
 
 
+@_guarded("sunday_ml_retrain")
 def sunday_ml_retrain() -> None:
     logger.info("sunday_ml_retrain: rolling retrain of weekly stock model")
     try:
         from ml.retrain import run_rolling_retrain
-        universe = _load_feature_universe()
-        if not universe:
-            logger.warning("sunday_ml_retrain: empty feature universe. Skipping retrain.")
-            return
-        result = run_rolling_retrain(
-            universe,
-            model_path=MODEL_PATH,
-            performance_writer=_write_model_performance,
-        )
-        if result.ok:
-            logger.info("sunday_ml_retrain: ok train={} test={} auc={} -> {}",
-                        result.n_train, result.n_test,
-                        result.metrics.get("auc"), MODEL_PATH)
-        else:
-            logger.warning("sunday_ml_retrain: skipped ({})", result.reason)
-    except Exception as exc:  # never let retrain crash the scheduler thread
-        logger.exception("sunday_ml_retrain failed: {}", exc)
+    except Exception as exc:
+        logger.warning("sunday_ml_retrain: ml stack unavailable ({}); skipping.", exc)
+        return "skipped: ml unavailable"
+    universe = _load_feature_universe()
+    if not universe:
+        logger.warning("sunday_ml_retrain: empty feature universe. Skipping retrain.")
+        return
+    result = run_rolling_retrain(
+        universe, model_path=MODEL_PATH, performance_writer=_write_model_performance,
+    )
+    if result.ok:
+        logger.info("sunday_ml_retrain: ok train={} test={} auc={} -> {}",
+                    result.n_train, result.n_test, result.metrics.get("auc"), MODEL_PATH)
+        return f"retrained auc={result.metrics.get('auc')}"
+    logger.warning("sunday_ml_retrain: skipped ({})", result.reason)
+    return f"skipped: {result.reason}"
 
 
+@_guarded("monday_stock_buys")
 def monday_stock_buys() -> None:
     rm = build_risk_manager()
-    if rm.is_halted:
+    if _rm_halted(rm):
         logger.warning("monday_stock_buys: RiskManager halted (monthly DD). No entries.")
-        return
+        return "halted"
     scored = db.get_latest_scored_universe()
     if scored is None or len(scored) == 0:
         logger.warning("monday_stock_buys: no scored universe. Run sunday_stock_scan first.")
-        return
+        return "no scored universe"
+    universe = _load_feature_universe()
+    if not universe:
+        logger.warning("monday_stock_buys: no feature universe available. No entries.")
+        return "no feature universe"
     state = get_account_state(rm, "stock")
     executor = StockExecutor.from_settings()
+    executor.paper_cash = state.cash
     result = stock_weekly.run_stock_weekly_buys(
         scored_df=scored,
-        universe=_symbols(scored),
+        universe=universe,
         equity=state.equity,
-        cash=state.cash,
+        available_cash=state.cash,
         executor=executor,
         risk_manager=rm,
+        open_positions=_position_dicts(state.open_positions),
     )
-    logger.info("monday_stock_buys: complete -> {}", result)
+    filled = sum(1 for r in getattr(result, "executed", []) if r.get("status") == "filled")
+    logger.info("monday_stock_buys: complete -> {} entries, {} filled",
+                len(getattr(result, "entries", [])), filled)
+    return f"entries={len(getattr(result, 'entries', []))} filled={filled}"
 
 
+@_guarded("midweek_stock_monitor")
 def midweek_stock_monitor() -> None:
     # Locked strategy: stop-loss monitoring only. No over-managing.
     positions = _open_positions("stock")
     if not positions:
-        return
+        return "no open positions"
+    symbols = [getattr(p, "symbol", "") for p in positions if getattr(p, "symbol", "")]
+    frames = _load_stock_frames(symbols, lookback_days=10)
+    prices = _latest_closes(frames)
+    if prices:
+        db.update_position_marks(prices)
     executor = StockExecutor.from_settings()
     closed = 0
     for p in positions:
+        symbol = getattr(p, "symbol", "")
         entry = float(getattr(p, "entry_price", 0.0) or 0.0)
-        mark = getattr(p, "current_price", None)
-        if entry <= 0 or mark is None:
+        stop = float(getattr(p, "stop_loss", 0.0) or 0.0)
+        mark = prices.get(symbol) or getattr(p, "current_price", None)
+        if entry <= 0 or not mark:
             continue
-        if float(mark) <= entry * (1.0 - STOCK_STOP_LOSS):
-            logger.warning("midweek stop hit {} entry={} mark={}",
-                           getattr(p, "symbol", "?"), entry, mark)
-            executor.close_long(getattr(p, "symbol", None))
-            closed += 1
-    _spy_breaker_check()
+        mark = float(mark)
+        stop_level = stop if stop > 0 else entry * (1.0 - settings.stock_stop_loss)
+        if mark <= stop_level:
+            logger.warning("midweek stop hit {} entry={} stop={} mark={}",
+                           symbol, entry, stop_level, mark)
+            result = executor.close_long(symbol, exit_price=mark, reason="stop_loss")
+            if result.get("status") == "filled":
+                closed += 1
     if closed:
         logger.info("midweek_stock_monitor: closed {} stopped-out position(s)", closed)
+    return f"marks={len(prices)} closed={closed}"
 
 
-def _spy_breaker_check() -> None:
-    # Optional market circuit breaker. Log-only by design: locked strategy says
-    # "no over-managing" mid-week. Promote to a hard flatten only if Phase 9
-    # validation supports it.
-    return
-
-
+@_guarded("friday_stock_sells")
 def friday_stock_sells() -> None:
-    rm = build_risk_manager()  # constructed for symmetry / future logging
     positions = _open_positions("stock")
     if not positions:
         logger.info("friday_stock_sells: no open stock positions.")
-        return
+        return "no open positions"
+    symbols = [getattr(p, "symbol", "") for p in positions if getattr(p, "symbol", "")]
+    universe = _load_stock_frames(symbols, lookback_days=90)
+    # Fallback marks so an exit is never priced at 0 when data is missing:
+    # synthesize a one-row frame from the last known mark (or entry).
+    import pandas as pd
+    for p in positions:
+        symbol = getattr(p, "symbol", "")
+        if symbol and symbol not in universe:
+            mark = float(getattr(p, "current_price", None)
+                         or getattr(p, "entry_price", 0.0) or 0.0)
+            if mark > 0:
+                universe[symbol] = pd.DataFrame({"close": [mark]})
     executor = StockExecutor.from_settings()
-    result = stock_weekly.run_stock_weekly_sells(open_positions=positions, executor=executor)
-    logger.info("friday_stock_sells: complete -> {}", result)
+    result = stock_weekly.run_stock_weekly_sells(
+        open_positions=_position_dicts(positions),
+        universe=universe,
+        executor=executor,
+    )
+    filled = sum(1 for r in getattr(result, "executed", []) if r.get("status") == "filled")
+    logger.info("friday_stock_sells: complete -> {} exits, {} filled",
+                len(getattr(result, "exits", [])), filled)
+    return f"exits={len(getattr(result, 'exits', []))} filled={filled}"
 
 
+@_guarded("crypto_cycle")
 def crypto_cycle() -> None:
     rm = build_risk_manager()
-    if rm.is_halted:
+    if _rm_halted(rm):
         logger.warning("crypto_cycle: RiskManager halted (monthly DD). No crypto entries.")
-        return
+        return "halted"
+    universe = _load_crypto_universe()
+    if not universe:
+        logger.warning("crypto_cycle: empty crypto universe (data fetch failed). Skipping.")
+        return "no data"
+    prices = _latest_closes(universe)
+    if prices:
+        db.update_position_marks(prices)
     state = get_account_state(rm, "crypto")
-    funding = {}
-    if hasattr(crypto_24h, "get_funding_rates"):
-        try:
-            funding = crypto_24h.get_funding_rates(CRYPTO_UNIVERSE)
-        except Exception as exc:
-            logger.warning("crypto_cycle: funding fetch failed ({}); proceeding with empty.", exc)
+    funding = _load_crypto_funding()
     result = crypto_24h.run_crypto_24h_pipeline(
-        universe=CRYPTO_UNIVERSE,
-        funding=funding,
-        open_positions=state.open_positions,
+        universe=universe,
+        funding_rates=funding,
+        open_positions=_position_dicts(state.open_positions),
         equity=state.equity,
-        cash=state.cash,
+        available_cash=state.cash,
+        btc_only=BTC_ONLY,
         risk_manager=rm,
     )
-    logger.info("crypto_cycle: complete -> {}", result)
+    executor = crypto_executor_from_settings()
+    executor.paper_cash = state.cash
+    closed = opened = 0
+    for plan in getattr(result, "exits", []):
+        exit_price = float(plan.close_price or 0.0) or prices.get(plan.symbol, 0.0)
+        if exit_price <= 0:
+            logger.warning("crypto_cycle: no price for exit {}; skipping this cycle", plan.symbol)
+            continue
+        r = executor.close_long(plan.symbol, exit_price=exit_price, reason=plan.reason)
+        closed += 1 if r.get("status") == "filled" else 0
+    for plan in getattr(result, "entries", []):
+        r = executor.open_long(
+            symbol=plan.symbol,
+            units=plan.units,
+            entry_price=plan.entry_price,
+            stop_loss=plan.stop_price,
+            take_profit=plan.take_profit,
+        )
+        opened += 1 if r.get("status") == "filled" else 0
+    logger.info("crypto_cycle: complete -> {} entries ({} filled), {} exits ({} filled)",
+                len(getattr(result, "entries", [])), opened,
+                len(getattr(result, "exits", [])), closed)
+    return f"opened={opened} closed={closed}"
 
 
+@_guarded("weekly_performance_report")
 def weekly_performance_report() -> None:
     logger.info("weekly_performance_report: building weekly P&L report")
+    from reporting import build_weekly_report, write_report
+    rm = build_risk_manager()
+    snap = get_account_snapshot(rm)
+    report = build_weekly_report(
+        nav=snap.equity,
+        stock_positions=_open_positions("stock"),
+        crypto_positions=_open_positions("crypto"),
+        environment=getattr(settings, "environment", "paper"),
+    )
+    path = write_report(report)
+    logger.info("weekly_performance_report: wrote {} (net={} trades={} win_rate={})",
+                path, report.net_pnl, report.total_trades, report.win_rate)
     try:
-        from reporting import build_weekly_report, write_report
-        rm = build_risk_manager()
-        report = build_weekly_report(
-            nav=rm.current_nav,
-            stock_positions=_open_positions("stock"),
-            crypto_positions=_open_positions("crypto"),
-            environment=getattr(settings, "environment", "paper"),
+        from monitoring import alert_manager
+        alert_manager.send_weekly_summary(
+            week=report.week_index,
+            net_pnl=report.net_pnl,
+            win_rate=report.win_rate,
+            total_trades=report.total_trades,
         )
-        path = write_report(report)
-        logger.info("weekly_performance_report: wrote {} (net={} trades={} win_rate={})",
-                    path, report.net_pnl, report.total_trades, report.win_rate)
-        try:
-            from monitoring import alert_manager
-            alert_manager.send_weekly_summary(
-                week=report.week_index,
-                net_pnl=report.net_pnl,
-                win_rate=report.win_rate,
-                total_trades=report.total_trades,
-            )
-        except Exception as exc:
-            logger.warning("weekly_performance_report: telegram summary failed: {}", exc)
-    except Exception as exc:  # never let reporting crash the scheduler thread
-        logger.exception("weekly_performance_report failed: {}", exc)
+    except Exception as exc:
+        logger.warning("weekly_performance_report: telegram summary failed: {}", exc)
+    return f"net={report.net_pnl}"
 
 
+@_guarded("daily_heartbeat")
 def daily_heartbeat() -> None:
-    logger.info("daily_heartbeat: sending status heartbeat")
+    rm = build_risk_manager()
+    snap = get_account_snapshot(rm)
+    stock_n = len(_open_positions("stock"))
+    crypto_n = len(_open_positions("crypto"))
+    status = "HALTED" if _rm_halted(rm) else ("PAUSED" if bot_state.paused else "OK")
+    msg = ("*Heartbeat* {}\nNAV: ${:,.2f} ({})\nOpen: {} stock / {} crypto").format(
+        status, snap.equity, snap.source, stock_n, crypto_n)
     try:
-        rm = build_risk_manager()
-        stock_n = len(_open_positions("stock"))
-        crypto_n = len(_open_positions("crypto"))
-        status = "HALTED" if rm.is_halted else "OK"
-        msg = ("*Heartbeat* {}\nNAV: ${:,.2f}\nOpen: {} stock / {} crypto").format(
-            status, float(rm.current_nav), stock_n, crypto_n)
-        try:
-            from monitoring import alert_manager
-            alert_manager.send(msg)
-        except Exception as exc:
-            logger.warning("daily_heartbeat: telegram send failed: {}", exc)
-        logger.info("daily_heartbeat: {} nav={}", status, rm.current_nav)
-    except Exception as exc:  # never let the heartbeat crash the scheduler thread
-        logger.exception("daily_heartbeat failed: {}", exc)
+        from monitoring import alert_manager
+        alert_manager.send(msg)
+    except Exception as exc:
+        logger.warning("daily_heartbeat: telegram send failed: {}", exc)
+    logger.info("daily_heartbeat: {} nav={} ({})", status, snap.equity, snap.source)
+    return f"{status} nav={snap.equity:.2f}"
 
 
 # ============================================================
 # REGISTRATION
 # ============================================================
+
+JOBS = {
+    "sunday_stock_scan": sunday_stock_scan,
+    "sunday_ml_retrain": sunday_ml_retrain,
+    "monday_stock_buys": monday_stock_buys,
+    "midweek_stock_monitor": midweek_stock_monitor,
+    "friday_stock_sells": friday_stock_sells,
+    "crypto_cycle": crypto_cycle,
+    "weekly_performance_report": weekly_performance_report,
+    "daily_heartbeat": daily_heartbeat,
+}
+
 
 def register_jobs(scheduler) -> None:
     tz = MARKET_TZ

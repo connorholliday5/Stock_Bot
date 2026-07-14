@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stock Bot</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:           #f9f9f7;
+    --surface-1:      #fcfcfb;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-1:       #2a78d6;
+    --delta-good:     #006300;
+    --delta-bad:      #d03b3b;
+    --status-good:    #0ca30c;
+    --status-warning: #fab219;
+    --status-critical:#d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:           #0d0d0d;
+      --surface-1:      #1a1a19;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-1:       #3987e5;
+      --delta-good:     #0ca30c;
+      --delta-bad:      #d03b3b;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:           #0d0d0d;
+    --surface-1:      #1a1a19;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --grid:           #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-1:       #3987e5;
+    --delta-good:     #0ca30c;
+    --delta-bad:      #d03b3b;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    margin-bottom: 18px;
+  }
+  header h1 { font-size: 18px; font-weight: 650; margin: 0 auto 0 0; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 10px; font-size: 12px; color: var(--text-secondary);
+    background: var(--surface-1);
+  }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+  .pill.ok .dot { background: var(--status-good); }
+  .pill.warn .dot { background: var(--status-warning); }
+  .pill.bad .dot { background: var(--status-critical); }
+
+  button {
+    font: inherit; font-size: 12.5px; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--surface-1); color: var(--text-primary);
+    padding: 5px 12px;
+  }
+  button:hover { border-color: var(--baseline); }
+  button.primary { background: var(--series-1); border-color: transparent; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+
+  .tiles {
+    display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    margin-bottom: 16px;
+  }
+  .tile {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 12px 14px;
+  }
+  .tile .label { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+  .tile .value { font-size: 26px; font-weight: 600; }
+  .tile .delta { font-size: 12px; margin-top: 2px; color: var(--text-muted); }
+  .tile .delta.up   { color: var(--delta-good); }
+  .tile .delta.down { color: var(--delta-bad); }
+
+  section.card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px; margin-bottom: 16px;
+  }
+  section.card h2 {
+    font-size: 13px; font-weight: 600; color: var(--text-secondary);
+    margin: 0 0 10px; text-transform: none;
+  }
+
+  .chart-wrap { position: relative; }
+  .chart-wrap svg { display: block; width: 100%; height: 240px; }
+  .tooltip {
+    position: absolute; pointer-events: none; display: none;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font-size: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.12); white-space: nowrap; z-index: 5;
+  }
+  .tooltip .val { font-weight: 650; font-size: 13px; }
+  .tooltip .when { color: var(--text-secondary); }
+
+  .table-scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px; white-space: nowrap; }
+  th { color: var(--text-muted); font-weight: 500; border-bottom: 1px solid var(--grid); }
+  td { border-bottom: 1px solid var(--grid); }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.pos { color: var(--delta-good); }
+  td.neg { color: var(--delta-bad); }
+  .empty { color: var(--text-muted); font-size: 13px; padding: 8px 0; }
+
+  .jobs { display: grid; gap: 8px; }
+  .job-row {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    border: 1px solid var(--grid); border-radius: 8px; padding: 8px 10px;
+  }
+  .job-row .name { font-weight: 550; min-width: 190px; }
+  .job-row .meta { color: var(--text-muted); font-size: 12px; flex: 1; min-width: 200px; }
+  .job-row .meta b { color: var(--text-secondary); font-weight: 550; }
+  .grid-2 { display: grid; gap: 16px; grid-template-columns: 1fr; }
+  @media (min-width: 900px) { .grid-2 { grid-template-columns: 1fr 1fr; } }
+
+  #toast {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: var(--text-primary); color: var(--page);
+    border-radius: 8px; padding: 8px 14px; font-size: 13px;
+    display: none; z-index: 10;
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Stock Bot</h1>
+    <span class="pill" id="pill-env"><span class="dot"></span><span>…</span></span>
+    <span class="pill" id="pill-capital"><span class="dot"></span><span>…</span></span>
+    <span class="pill" id="pill-state"><span class="dot"></span><span>…</span></span>
+    <button id="btn-pause">Pause entries</button>
+    <button id="btn-theme" title="Toggle theme">◐</button>
+  </header>
+
+  <div class="tiles">
+    <div class="tile">
+      <div class="label">Account equity</div>
+      <div class="value" id="tile-equity">—</div>
+      <div class="delta" id="tile-equity-src"></div>
+    </div>
+    <div class="tile">
+      <div class="label">Cash available</div>
+      <div class="value" id="tile-cash">—</div>
+      <div class="delta" id="tile-buying"></div>
+    </div>
+    <div class="tile">
+      <div class="label">Open positions</div>
+      <div class="value" id="tile-open">—</div>
+      <div class="delta" id="tile-open-split"></div>
+    </div>
+    <div class="tile">
+      <div class="label">Net P&amp;L (closed)</div>
+      <div class="value" id="tile-pnl">—</div>
+      <div class="delta" id="tile-pnl-delta"></div>
+    </div>
+    <div class="tile">
+      <div class="label">Win rate</div>
+      <div class="value" id="tile-winrate">—</div>
+      <div class="delta" id="tile-trades"></div>
+    </div>
+  </div>
+
+  <section class="card">
+    <h2>Equity curve — realized, anchored to current account equity</h2>
+    <div class="chart-wrap" id="chart-wrap">
+      <svg id="chart" role="img" aria-label="Equity curve line chart"></svg>
+      <div class="tooltip" id="chart-tip"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Open positions</h2>
+    <div class="table-scroll"><table id="tbl-positions"></table></div>
+    <div class="empty" id="empty-positions" hidden>No open positions.</div>
+  </section>
+
+  <div class="grid-2">
+    <section class="card">
+      <h2>Recent trades</h2>
+      <div class="table-scroll"><table id="tbl-trades"></table></div>
+      <div class="empty" id="empty-trades" hidden>No trades yet.</div>
+    </section>
+    <section class="card">
+      <h2>Recent signals</h2>
+      <div class="table-scroll"><table id="tbl-signals"></table></div>
+      <div class="empty" id="empty-signals" hidden>No signals yet.</div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>Scheduled jobs (America/New_York schedule)</h2>
+    <div class="jobs" id="jobs"></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+/* ---------- theme toggle ---------- */
+const themeBtn = document.getElementById("btn-theme");
+themeBtn.addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const cur = root.dataset.theme || (dark ? "dark" : "light");
+  root.dataset.theme = cur === "dark" ? "light" : "dark";
+  render();  // re-render chart with new ink colors
+});
+
+/* ---------- helpers ---------- */
+const $ = (id) => document.getElementById(id);
+const fmtUsd = (v) => v == null ? "—" :
+  (v < 0 ? "-$" : "$") + Math.abs(v).toLocaleString(undefined,
+    {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const fmtQty = (v) => v == null ? "" : (+v).toLocaleString(undefined, {maximumFractionDigits: 6});
+const fmtPct = (v) => v == null ? "" : (v * 100).toFixed(2) + "%";
+const fmtWhen = (iso) => iso ? new Date(iso).toLocaleString([], {month:"short", day:"numeric",
+  hour:"2-digit", minute:"2-digit"}) : "—";
+
+function toast(msg, ms = 2600) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.style.display = "block";
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.style.display = "none", ms);
+}
+
+let authToken = localStorage.getItem("botToken") || "";
+async function api(path, opts = {}) {
+  const headers = opts.headers || {};
+  if (opts.method === "POST" && authToken) headers["Authorization"] = "Bearer " + authToken;
+  const res = await fetch(path, {...opts, headers});
+  if (res.status === 401) {
+    const tok = prompt("Control token required (WEB_AUTH_TOKEN):");
+    if (tok) { authToken = tok; localStorage.setItem("botToken", tok); return api(path, opts); }
+  }
+  if (!res.ok) throw new Error(path + " -> " + res.status);
+  return res.json();
+}
+
+/* ---------- state ---------- */
+const state = { status: null, account: null, curve: null, perf: null,
+                positions: [], trades: [], signals: [] };
+
+async function refresh() {
+  const jobs = [
+    api("/api/status").then(d => state.status = d),
+    api("/api/account").then(d => state.account = d),
+    api("/api/equity-curve").then(d => state.curve = d),
+    api("/api/performance").then(d => state.perf = d),
+    api("/api/positions").then(d => state.positions = d),
+    api("/api/trades?limit=25").then(d => state.trades = d),
+    api("/api/signals?limit=25").then(d => state.signals = d),
+  ];
+  const results = await Promise.allSettled(jobs);
+  const failed = results.filter(r => r.status === "rejected").length;
+  if (failed === results.length) toast("Cannot reach the bot API");
+  render();
+}
+
+/* ---------- render: pills, tiles ---------- */
+function setPill(id, cls, text) {
+  const el = $(id);
+  el.className = "pill " + cls;
+  el.lastElementChild.textContent = text;
+}
+
+function renderHeader() {
+  const s = state.status;
+  if (!s) return;
+  const modeLabel = {sim: "SIMULATED", paper: "PAPER API", live: "LIVE"}[s.execution_mode] || s.execution_mode;
+  setPill("pill-env", s.execution_mode === "live" ? "warn" : "ok", modeLabel);
+  const a = state.account;
+  setPill("pill-capital", "ok",
+    (s.capital_source === "broker" ? "Alpaca account" : "Static capital") +
+    (a && a.is_paper === false ? " · live acct" : ""));
+  if (s.halted)       setPill("pill-state", "bad",  "HALTED (drawdown)");
+  else if (s.paused)  setPill("pill-state", "warn", "Paused");
+  else                setPill("pill-state", "ok",   s.scheduler_running ? "Running" : "Scheduler off");
+  const btn = $("btn-pause");
+  btn.textContent = s.paused ? "Resume entries" : "Pause entries";
+  btn.className = s.paused ? "primary" : "";
+}
+
+function renderTiles() {
+  const a = state.account, p = state.perf;
+  if (a) {
+    $("tile-equity").textContent = fmtUsd(a.equity);
+    $("tile-equity-src").textContent = a.source === "broker"
+      ? "live from Alpaca" : "reconstructed (offline)";
+    $("tile-cash").textContent = fmtUsd(a.cash);
+    $("tile-buying").textContent = "buying power " + fmtUsd(a.buying_power);
+    const total = a.open_stock_positions + a.open_crypto_positions;
+    $("tile-open").textContent = total;
+    $("tile-open-split").textContent =
+      a.open_stock_positions + " stock · " + a.open_crypto_positions + " crypto";
+  }
+  if (p) {
+    const all = p.all;
+    const el = $("tile-pnl");
+    el.textContent = fmtUsd(all.net_pnl);
+    const d = $("tile-pnl-delta");
+    d.textContent = "stock " + fmtUsd(p.stock.net_pnl) + " · crypto " + fmtUsd(p.crypto.net_pnl);
+    d.className = "delta " + (all.net_pnl > 0 ? "up" : all.net_pnl < 0 ? "down" : "");
+    $("tile-winrate").textContent = all.trades ? all.win_rate.toFixed(1) + "%" : "—";
+    $("tile-trades").textContent = all.trades + " closed trades";
+  }
+}
+
+/* ---------- equity curve (SVG line, crosshair + tooltip) ---------- */
+function css(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function renderChart() {
+  const svg = $("chart"), wrap = $("chart-wrap"), tip = $("chart-tip");
+  const data = (state.curve && state.curve.points) || [];
+  svg.replaceChildren();
+  if (data.length === 0) return;
+
+  const W = wrap.clientWidth || 800, H = 240;
+  const padL = 56, padR = 16, padT = 12, padB = 24;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+  const vals = data.map(d => d.equity);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const span = hi - lo; lo -= span * 0.08; hi += span * 0.08;
+
+  const n = data.length;
+  const x = (i) => n === 1 ? (padL + (W - padL - padR) / 2)
+                           : padL + (W - padL - padR) * (i / (n - 1));
+  const y = (v) => padT + (H - padT - padB) * (1 - (v - lo) / (hi - lo));
+
+  const NS = "http://www.w3.org/2000/svg";
+  const el = (t, attrs) => {
+    const e = document.createElementNS(NS, t);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  };
+
+  // gridlines + clean y ticks (hairline, recessive)
+  const ticks = 4;
+  for (let i = 0; i <= ticks; i++) {
+    const v = lo + (hi - lo) * (i / ticks);
+    const yy = y(v);
+    svg.appendChild(el("line", {x1: padL, x2: W - padR, y1: yy, y2: yy,
+      stroke: css("--grid"), "stroke-width": 1}));
+    const label = el("text", {x: padL - 8, y: yy + 4, "text-anchor": "end",
+      fill: css("--text-muted"), "font-size": 11});
+    label.textContent = "$" + Math.round(v).toLocaleString();
+    svg.appendChild(label);
+  }
+
+  // area wash (~10% opacity) + 2px line, round joins
+  const pts = data.map((d, i) => [x(i), y(d.equity)]);
+  const line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+  const area = line + ` L ${pts[pts.length-1][0].toFixed(1)} ${H - padB}` +
+               ` L ${pts[0][0].toFixed(1)} ${H - padB} Z`;
+  svg.appendChild(el("path", {d: area, fill: css("--series-1"), "fill-opacity": 0.1}));
+  svg.appendChild(el("path", {d: line, fill: "none", stroke: css("--series-1"),
+    "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round"}));
+
+  // end marker: >=8px dot with 2px surface ring
+  const last = pts[pts.length - 1];
+  svg.appendChild(el("circle", {cx: last[0], cy: last[1], r: 6,
+    fill: css("--series-1"), stroke: css("--surface-1"), "stroke-width": 2}));
+
+  // end label: value at the line end (text token, not series color)
+  const endLabel = el("text", {x: Math.min(last[0] + 8, W - padR - 4), y: last[1] - 10,
+    "text-anchor": "end", fill: css("--text-secondary"), "font-size": 11, "font-weight": 600});
+  endLabel.textContent = fmtUsd(data[data.length - 1].equity);
+  svg.appendChild(endLabel);
+
+  // crosshair + tooltip: snap to nearest point; whole surface is the hit target
+  const hair = el("line", {y1: padT, y2: H - padB, stroke: css("--baseline"),
+    "stroke-width": 1, visibility: "hidden"});
+  svg.appendChild(hair);
+  const dot = el("circle", {r: 5, fill: css("--series-1"),
+    stroke: css("--surface-1"), "stroke-width": 2, visibility: "hidden"});
+  svg.appendChild(dot);
+
+  const show = (evt) => {
+    const rect = svg.getBoundingClientRect();
+    const px = (evt.clientX - rect.left) * (W / rect.width);
+    let best = 0, bestD = Infinity;
+    pts.forEach((p, i) => { const d = Math.abs(p[0] - px); if (d < bestD) { bestD = d; best = i; } });
+    const [cx, cy] = pts[best];
+    hair.setAttribute("x1", cx); hair.setAttribute("x2", cx);
+    hair.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", cx); dot.setAttribute("cy", cy);
+    dot.setAttribute("visibility", "visible");
+    const d = data[best];
+    tip.replaceChildren();
+    const v = document.createElement("div"); v.className = "val";
+    v.textContent = fmtUsd(d.equity);
+    const w = document.createElement("div"); w.className = "when";
+    w.textContent = d.t ? fmtWhen(d.t) : "starting capital";
+    tip.append(v, w);
+    tip.style.display = "block";
+    const wrapRect = wrap.getBoundingClientRect();
+    let left = (cx / W) * wrapRect.width + 12;
+    if (left + tip.offsetWidth > wrapRect.width - 4) left -= tip.offsetWidth + 24;
+    tip.style.left = left + "px";
+    tip.style.top = Math.max(0, (cy / H) * wrapRect.height - tip.offsetHeight - 8) + "px";
+  };
+  const hide = () => { hair.setAttribute("visibility", "hidden");
+    dot.setAttribute("visibility", "hidden"); tip.style.display = "none"; };
+  svg.addEventListener("pointermove", show);
+  svg.addEventListener("pointerleave", hide);
+}
+
+/* ---------- tables ---------- */
+function buildTable(tbl, headers, rows, build) {
+  tbl.replaceChildren();
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  headers.forEach(([label, cls]) => {
+    const th = document.createElement("th");
+    th.textContent = label;
+    if (cls) th.className = cls;
+    hr.appendChild(th);
+  });
+  thead.appendChild(hr);
+  tbl.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  rows.forEach(r => tbody.appendChild(build(r)));
+  tbl.appendChild(tbody);
+}
+
+function td(text, cls) {
+  const c = document.createElement("td");
+  c.textContent = text == null ? "—" : text;
+  if (cls) c.className = cls;
+  return c;
+}
+
+function renderPositions() {
+  const rows = state.positions;
+  $("empty-positions").hidden = rows.length > 0;
+  buildTable($("tbl-positions"),
+    [["Symbol"], ["Type"], ["Qty", "num"], ["Entry", "num"], ["Mark", "num"],
+     ["Stop", "num"], ["Unrealized", "num"], ["Opened"]],
+    rows, (p) => {
+      const tr = document.createElement("tr");
+      const pnl = p.unrealized_pnl;
+      tr.append(
+        td(p.symbol), td(p.asset_type), td(fmtQty(p.quantity), "num"),
+        td(fmtUsd(p.entry_price), "num"), td(fmtUsd(p.current_price), "num"),
+        td(fmtUsd(p.stop_loss), "num"),
+        td(pnl == null ? "—" : fmtUsd(pnl) + (p.unrealized_pnl_pct != null ?
+           " (" + fmtPct(p.unrealized_pnl_pct) + ")" : ""),
+           "num " + (pnl > 0 ? "pos" : pnl < 0 ? "neg" : "")),
+        td(fmtWhen(p.opened_at)));
+      return tr;
+    });
+}
+
+function renderTrades() {
+  const rows = state.trades;
+  $("empty-trades").hidden = rows.length > 0;
+  buildTable($("tbl-trades"),
+    [["Symbol"], ["Side"], ["Qty", "num"], ["P&L", "num"], ["Reason"], ["When"]],
+    rows, (t) => {
+      const tr = document.createElement("tr");
+      tr.append(
+        td(t.symbol), td(t.side), td(fmtQty(t.quantity), "num"),
+        td(t.pnl == null ? "—" : fmtUsd(t.pnl),
+           "num " + (t.pnl > 0 ? "pos" : t.pnl < 0 ? "neg" : "")),
+        td(t.close_reason || (t.side === "buy" ? "entry" : "")),
+        td(fmtWhen(t.closed_at || t.opened_at)));
+      return tr;
+    });
+}
+
+function renderSignals() {
+  const rows = state.signals;
+  $("empty-signals").hidden = rows.length > 0;
+  buildTable($("tbl-signals"),
+    [["Symbol"], ["Type"], ["Direction"], ["Score", "num"], ["Acted"], ["When"]],
+    rows, (s) => {
+      const tr = document.createElement("tr");
+      tr.append(
+        td(s.symbol), td(s.asset_type), td(s.direction),
+        td(s.composite_score == null ? "—" : (+s.composite_score).toFixed(3), "num"),
+        td(s.acted_on ? "yes" : "no"), td(fmtWhen(s.created_at)));
+      return tr;
+    });
+}
+
+/* ---------- jobs panel ---------- */
+const JOB_LABELS = {
+  sunday_stock_scan: "Sunday stock scan",
+  sunday_ml_retrain: "Sunday ML retrain",
+  monday_stock_buys: "Monday stock buys",
+  midweek_stock_monitor: "Mid-week stop monitor",
+  friday_stock_sells: "Friday stock sells",
+  crypto_cycle: "Crypto 4h cycle",
+  weekly_performance_report: "Weekly report",
+  daily_heartbeat: "Daily heartbeat",
+};
+
+function renderJobs() {
+  const s = state.status;
+  if (!s) return;
+  const wrap = $("jobs");
+  wrap.replaceChildren();
+  (s.jobs || []).forEach(job => {
+    const row = document.createElement("div");
+    row.className = "job-row";
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = JOB_LABELS[job.id] || job.id;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const last = (s.last_runs || {})[job.id];
+    const lastTxt = last
+      ? `last: ${fmtWhen(last.started_at)} ${last.ok === false ? "✗ " + (last.detail || "failed")
+          : "✓ " + (last.detail || "ok")}`
+      : "last: never";
+    const b = document.createElement("b");
+    b.textContent = "next: " + fmtWhen(job.next_run);
+    meta.append(b, document.createTextNode("  ·  " + lastTxt));
+    const btn = document.createElement("button");
+    btn.textContent = "Run now";
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        await api(`/api/jobs/${job.id}/run`, {method: "POST"});
+        toast("Started " + (JOB_LABELS[job.id] || job.id));
+        setTimeout(refresh, 4000);
+      } catch (e) { toast("Failed: " + e.message); }
+      btn.disabled = false;
+    });
+    row.append(name, meta, btn);
+    wrap.appendChild(row);
+  });
+}
+
+/* ---------- controls ---------- */
+$("btn-pause").addEventListener("click", async () => {
+  const paused = state.status && state.status.paused;
+  try {
+    await api(paused ? "/api/control/resume" : "/api/control/pause", {method: "POST"});
+    toast(paused ? "Entries resumed" : "Paused — exits & stop-losses stay active");
+    await refresh();
+  } catch (e) { toast("Failed: " + e.message); }
+});
+
+/* ---------- boot ---------- */
+function render() {
+  renderHeader(); renderTiles(); renderChart();
+  renderPositions(); renderTrades(); renderSignals(); renderJobs();
+}
+refresh();
+setInterval(refresh, 30000);
+addEventListener("resize", () => renderChart());
+</script>
+</body>
+</html>

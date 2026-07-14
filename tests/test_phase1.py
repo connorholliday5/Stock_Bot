@@ -48,10 +48,15 @@ class TestSettings:
         assert len(settings.crypto_universe) >= 1
 
     def test_database_url_format(self):
-        """Database URL is properly formatted"""
-        from config import settings
-        url = settings.database_url
-        assert url.startswith("postgresql://")
+        """Postgres when DB_PASSWORD is set; SQLite fallback otherwise;
+        DATABASE_URL always wins."""
+        from config.settings import Settings
+        pg = Settings(db_password="secret", _env_file=None)
+        assert pg.database_url.startswith("postgresql://")
+        lite = Settings(db_password="", _env_file=None)
+        assert lite.database_url.startswith("sqlite:///")
+        override = Settings(database_url_override="postgresql://u:p@h:5/x", _env_file=None)
+        assert override.database_url == "postgresql://u:p@h:5/x"
 
 
 class TestDatabaseSchema:

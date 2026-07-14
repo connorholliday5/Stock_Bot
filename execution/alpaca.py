@@ -66,23 +66,27 @@ class StockExecutor:
     @classmethod
     def from_settings(cls, paper: Optional[bool] = None) -> "StockExecutor":
         """
-        Build a StockExecutor from config. In live mode this constructs an Alpaca
-        TradingClient; in paper mode no SDK is required.
+        Build a StockExecutor from config, honoring settings.execution_mode:
+        "sim" simulates fills locally (no SDK needed); "paper" routes real
+        orders to the Alpaca paper API; "live" routes to the live API.
         """
-        is_paper = settings.is_paper if paper is None else paper
+        if paper is None:
+            is_sim = settings.execution_mode == "sim"
+        else:
+            is_sim = paper
         client = None
-        if not is_paper:
+        if not is_sim:
             try:
                 from alpaca.trading.client import TradingClient  # type: ignore
                 client = TradingClient(
                     settings.alpaca_api_key,
                     settings.alpaca_secret_key,
-                    paper=False,
+                    paper=settings.alpaca_paper,
                 )
             except Exception as exc:
-                logger.error("Alpaca client init failed, falling back to paper: %s", exc)
-                is_paper = True
-        return cls(paper=is_paper, client=client)
+                logger.error("Alpaca client init failed, falling back to sim: %s", exc)
+                is_sim = True
+        return cls(paper=is_sim, client=client)
 
     # -- balances / state ---------------------------------------------------
 
