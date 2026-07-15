@@ -60,6 +60,10 @@ class StockExecutor:
             max_positions if max_positions is not None
             else int(getattr(settings, "max_stock_positions", 8))
         )
+        # Backstop floor; the scheduler tightens this per-cycle from account
+        # equity via risk.manager.effective_min_position.
+        self.min_position_usd = float(
+            getattr(settings, "min_position_size", MIN_POSITION_USD))
 
     # -- client bootstrap (live only) --------------------------------------
 
@@ -168,8 +172,8 @@ class StockExecutor:
     ) -> dict:
         """Open a long equity position. Enforces max-position and min-notional backstops."""
         notional = units * entry_price
-        if notional < MIN_POSITION_USD:
-            logger.warning("open_long %s rejected: notional $%.2f < min $%.2f", symbol, notional, MIN_POSITION_USD)
+        if notional < self.min_position_usd:
+            logger.warning("open_long %s rejected: notional $%.2f < min $%.2f", symbol, notional, self.min_position_usd)
             return {"status": "rejected", "reason": "below_min_notional", "symbol": symbol}
 
         with get_db() as db:

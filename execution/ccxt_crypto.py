@@ -50,6 +50,14 @@ class CryptoExecutor:
         self.paper_cash = paper_cash
         self.fee_rate = fee_rate
         self.max_positions = max_positions
+        # Backstop floor; the scheduler tightens this per-cycle from account
+        # equity via risk.manager.effective_min_position.
+        try:
+            from config import settings as _settings
+            self.min_position_usd = float(
+                getattr(_settings, "min_position_size", MIN_POSITION_USD))
+        except Exception:
+            self.min_position_usd = MIN_POSITION_USD
 
     # -- balances / state ---------------------------------------------------
 
@@ -120,8 +128,8 @@ class CryptoExecutor:
     ) -> dict:
         """Open a long spot position. Enforces max-position and min-notional backstops."""
         notional = units * entry_price
-        if notional < MIN_POSITION_USD:
-            logger.warning("open_long %s rejected: notional $%.2f < min $%.2f", symbol, notional, MIN_POSITION_USD)
+        if notional < self.min_position_usd:
+            logger.warning("open_long %s rejected: notional $%.2f < min $%.2f", symbol, notional, self.min_position_usd)
             return {"status": "rejected", "reason": "below_min_notional", "symbol": symbol}
 
         with get_db() as db:

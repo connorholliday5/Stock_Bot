@@ -99,7 +99,9 @@ class SizingResult:
 
     @property
     def tradable(self) -> bool:
-        return self.units > 0 and self.notional >= MIN_POSITION_USD
+        # The sizing engine enforces the (equity-adaptive) minimum-position
+        # floor and zeroes units when breached, so units > 0 is the contract.
+        return self.units > 0 and self.notional > 0
 
 
 @dataclass

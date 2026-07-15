@@ -29,16 +29,15 @@ from data.fetcher import add_features
 
 UTC = timezone.utc
 
-# Liquid large-cap scan universe used when Polygon (full S&P 500 constituents)
-# is not configured. Matches the Polygon fetcher's fallback seed list.
-DEFAULT_STOCK_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
-    "JPM", "LLY", "V", "UNH", "XOM", "MA", "JNJ", "PG", "HD", "AVGO",
-    "COST", "MRK", "ABBV", "CVX", "CRM", "BAC", "NFLX", "AMD", "PEP",
-    "KO", "TMO", "WMT", "MCD", "DIS", "CSCO", "ABT", "ADBE", "DHR",
-    "NEE", "ACN", "TXN", "CMCSA", "VZ", "INTC", "PM", "RTX", "ORCL",
-    "QCOM", "HON", "T", "AMGN", "IBM", "CAT", "DE", "GS", "MS",
-]
+def default_stock_universe() -> list[str]:
+    """Scan universe for the Alpaca (no-Polygon) path: the STOCK_UNIVERSE env
+    override when set (comma-separated), else the full built-in S&P 500 list."""
+    override = getattr(settings, "stock_universe", "") or ""
+    tickers = [t.strip().upper() for t in override.split(",") if t.strip()]
+    if tickers:
+        return tickers
+    from data.sp500 import SP500_TICKERS
+    return list(SP500_TICKERS)
 
 DEFAULT_CRYPTO_UNIVERSE = ["BTC/USD", "ETH/USD", "SOL/USD", "LTC/USD"]
 
@@ -88,7 +87,7 @@ def fetch_stock_universe_alpaca(
     tickers: Optional[list[str]] = None,
 ) -> dict[str, pd.DataFrame]:
     """Daily-bar feature universe from Alpaca IEX data. {} on total failure."""
-    tickers = list(tickers or DEFAULT_STOCK_UNIVERSE)
+    tickers = list(tickers or default_stock_universe())
     try:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
@@ -145,14 +144,30 @@ def fetch_crypto_universe_alpaca(
 
 def fetch_latest_crypto_price_alpaca(symbol: str) -> Optional[float]:
     """Latest trade price for one pair; None on failure."""
+    prices = fetch_latest_crypto_prices_alpaca([symbol])
+    return prices.get(symbol)
+
+
+def fetch_latest_crypto_prices_alpaca(symbols: list[str]) -> dict[str, float]:
+    """Latest trade prices for many pairs in ONE keyless request - cheap
+    enough for the 15-minute crypto stop monitor. {} on failure."""
+    symbols = [s for s in symbols if s]
+    if not symbols:
+        return {}
     try:
         from alpaca.data.historical import CryptoHistoricalDataClient
         from alpaca.data.requests import CryptoLatestTradeRequest
 
         client = CryptoHistoricalDataClient()
-        req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
-        trade = client.get_crypto_latest_trade(req)
-        return float(trade[symbol].price)
+        req = CryptoLatestTradeRequest(symbol_or_symbols=symbols)
+        trades = client.get_crypto_latest_trade(req)
+        out: dict[str, float] = {}
+        for sym in symbols:
+            trade = trades.get(sym)
+            price = float(getattr(trade, "price", 0.0) or 0.0) if trade else 0.0
+            if price > 0:
+                out[sym] = price
+        return out
     except Exception as exc:
-        logger.warning("alpaca_data: latest price fetch failed for {} ({})", symbol, exc)
-        return None
+        logger.warning("alpaca_data: latest price fetch failed for {} ({})", symbols, exc)
+        return {}

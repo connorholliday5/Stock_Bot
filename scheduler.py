@@ -34,7 +34,7 @@ from loguru import logger
 
 from config.settings import settings
 from database import db
-from risk.manager import RiskManager, MONTHLY_DRAWDOWN_HALT
+from risk.manager import RiskManager, MONTHLY_DRAWDOWN_HALT, effective_min_position
 from execution.alpaca import StockExecutor
 from execution.account import get_account_snapshot
 from execution.alpaca_crypto import crypto_executor_from_settings, to_alpaca_symbol
@@ -49,7 +49,12 @@ except Exception:  # pragma: no cover - apscheduler present on target machine
     CronTrigger = None
 
 MARKET_TZ = "America/New_York"  # ET; APScheduler resolves EST/EDT.
-BTC_ONLY = True                 # locked strategy: BTC-only until 60 days profitable.
+
+
+def _btc_only() -> bool:
+    """Locked strategy: BTC-only entries until 60 profitable days, then flip
+    CRYPTO_BTC_ONLY=false in .env (the scan universe is already wider)."""
+    return bool(getattr(settings, "crypto_btc_only", True))
 
 # Trained weekly stock model artifact (booster at MODEL_PATH + ".json",
 # metadata at MODEL_PATH + ".meta.json"). TrainedModel.save creates the dir.
@@ -328,6 +333,7 @@ def monday_stock_buys() -> None:
     state = get_account_state(rm, "stock")
     executor = StockExecutor.from_settings()
     executor.paper_cash = state.cash
+    executor.min_position_usd = effective_min_position(state.equity)
     result = stock_weekly.run_stock_weekly_buys(
         scored_df=scored,
         universe=universe,
@@ -427,11 +433,12 @@ def crypto_cycle() -> None:
         open_positions=_position_dicts(state.open_positions),
         equity=state.equity,
         available_cash=state.cash,
-        btc_only=BTC_ONLY,
+        btc_only=_btc_only(),
         risk_manager=rm,
     )
     executor = crypto_executor_from_settings()
     executor.paper_cash = state.cash
+    executor.min_position_usd = effective_min_position(state.equity)
     closed = opened = 0
     for plan in getattr(result, "exits", []):
         exit_price = float(plan.close_price or 0.0) or prices.get(plan.symbol, 0.0)
@@ -453,6 +460,51 @@ def crypto_cycle() -> None:
                 len(getattr(result, "entries", [])), opened,
                 len(getattr(result, "exits", [])), closed)
     return f"opened={opened} closed={closed}"
+
+
+def _latest_crypto_prices(symbols: list[str]) -> dict:
+    """{position symbol: latest price}. One keyless Alpaca request; symbols
+    are mapped to /USD pairs for the query and keyed back to the originals
+    (positions may carry Binance-style /USDT names)."""
+    if not symbols:
+        return {}
+    try:
+        from data.alpaca_data import fetch_latest_crypto_prices_alpaca
+        mapped = {s: to_alpaca_symbol(s) for s in symbols}
+        fetched = fetch_latest_crypto_prices_alpaca(list(set(mapped.values())))
+        return {orig: fetched[alp] for orig, alp in mapped.items() if alp in fetched}
+    except Exception as exc:
+        logger.warning("_latest_crypto_prices failed ({})", exc)
+        return {}
+
+
+@_guarded("crypto_stop_monitor")
+def crypto_stop_monitor() -> None:
+    """Risk-reducing: between 4h cycles, check crypto stops every 15 minutes
+    so a sharp move can't run unprotected for hours. Never paused. Makes no
+    API call at all while there are no open crypto positions."""
+    positions = _open_positions("crypto")
+    if not positions:
+        return "no open positions"
+    symbols = [getattr(p, "symbol", "") for p in positions if getattr(p, "symbol", "")]
+    prices = _latest_crypto_prices(symbols)
+    if prices:
+        db.update_position_marks(prices)
+    executor = crypto_executor_from_settings()
+    closed = 0
+    for p in positions:
+        symbol = getattr(p, "symbol", "")
+        stop = float(getattr(p, "stop_loss", 0.0) or 0.0)
+        mark = prices.get(symbol) or getattr(p, "current_price", None)
+        if stop <= 0 or not mark:
+            continue
+        if float(mark) <= stop:
+            logger.warning("crypto stop hit {} stop={} mark={}", symbol, stop, mark)
+            r = executor.close_long(symbol, exit_price=float(mark), reason="stop_loss")
+            closed += 1 if r.get("status") == "filled" else 0
+    if closed:
+        logger.info("crypto_stop_monitor: closed {} stopped-out position(s)", closed)
+    return f"marks={len(prices)} closed={closed}"
 
 
 @_guarded("weekly_performance_report")
@@ -512,6 +564,7 @@ JOBS = {
     "midweek_stock_monitor": midweek_stock_monitor,
     "friday_stock_sells": friday_stock_sells,
     "crypto_cycle": crypto_cycle,
+    "crypto_stop_monitor": crypto_stop_monitor,
     "weekly_performance_report": weekly_performance_report,
     "daily_heartbeat": daily_heartbeat,
 }
@@ -537,6 +590,9 @@ def register_jobs(scheduler) -> None:
     scheduler.add_job(crypto_cycle,
                       CronTrigger(hour="*/4", minute=0, timezone=tz),
                       id="crypto_cycle", replace_existing=True)
+    scheduler.add_job(crypto_stop_monitor,
+                      CronTrigger(minute="*/15", timezone=tz),
+                      id="crypto_stop_monitor", replace_existing=True)
     scheduler.add_job(weekly_performance_report,
                       CronTrigger(day_of_week="fri", hour=16, minute=30, timezone=tz),
                       id="weekly_performance_report", replace_existing=True)

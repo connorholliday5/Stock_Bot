@@ -11,13 +11,23 @@ running, so pausing can never strand an open position without protection.
 
 from __future__ import annotations
 
+import json
 import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 UTC = timezone.utc
+
+
+def _state_file() -> Optional[Path]:
+    try:
+        from config import settings
+        return Path(getattr(settings, "data_dir", "data_store")) / "bot_state.json"
+    except Exception:
+        return None
 
 
 @dataclass
@@ -42,11 +52,32 @@ class BotState:
     def __init__(self, history_size: int = 200) -> None:
         self._lock = threading.Lock()
         self.started_at = datetime.now(UTC)
-        self._paused = False
+        self._paused = self._load_paused()
         self._history: deque[JobRun] = deque(maxlen=history_size)
         self._last: dict[str, JobRun] = {}
 
-    # -- pause / resume -----------------------------------------------------
+    # -- pause / resume (persisted so a restart can't silently resume) -------
+
+    @staticmethod
+    def _load_paused() -> bool:
+        path = _state_file()
+        try:
+            if path is not None and path.exists():
+                return bool(json.loads(path.read_text()).get("paused", False))
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _save_paused(paused: bool) -> None:
+        path = _state_file()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"paused": paused}))
+        except Exception:
+            pass  # persistence is best-effort; in-memory state still rules
 
     @property
     def paused(self) -> bool:
@@ -56,10 +87,12 @@ class BotState:
     def pause(self) -> None:
         with self._lock:
             self._paused = True
+        self._save_paused(True)
 
     def resume(self) -> None:
         with self._lock:
             self._paused = False
+        self._save_paused(False)
 
     # -- job accounting -------------------------------------------------------
 

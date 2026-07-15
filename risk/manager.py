@@ -64,6 +64,19 @@ CRYPTO_MAX_POSITION_NOTIONAL_PCT = 0.35  # carried over from Phase 4
 MONTHLY_DRAWDOWN_HALT = -0.15      # <= -15% intramonth halts new entries
 
 MIN_POSITION_USD = 50.0
+ABSOLUTE_MIN_POSITION_USD = 10.0   # below this, fees/spread dominate any edge
+
+
+def effective_min_position(equity: float, configured: Optional[float] = None) -> float:
+    """Adaptive position floor: the configured minimum (MIN_POSITION_SIZE),
+    but never more than 10% of equity - so a small account (e.g. $230) can
+    still open ~$23 positions instead of being locked out by the $50 default.
+    Hard floor $10: under that, fees and spread dominate any edge."""
+    if configured is None:
+        configured = float(getattr(settings, "min_position_size", MIN_POSITION_USD))
+    if equity and equity > 0:
+        return max(ABSOLUTE_MIN_POSITION_USD, min(configured, 0.10 * float(equity)))
+    return configured
 
 DEFAULT_WIN_RATE = 0.5             # placeholders until ML phase calibrates from live stats
 DEFAULT_WIN_LOSS_RATIO = 1.5
@@ -259,7 +272,7 @@ def size_position(
             notional = cash_ceiling
             units = notional / eff_entry
 
-    if notional < params.min_position_usd:
+    if notional < effective_min_position(equity, params.min_position_usd):
         return PositionSize(0.0, notional, effective_risk_pct, final_stop, take_profit,
                             "below_min_position")
 

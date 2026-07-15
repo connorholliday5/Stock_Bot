@@ -92,6 +92,14 @@ class Settings(BaseSettings):
     # USDT-quoted (Binance style); the Alpaca path maps these to /USD pairs.
     # All four trade on both venues (BNB deliberately absent - not on Alpaca).
     crypto_universe: list = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "LTC/USDT"]
+    # Locked strategy: entries stay BTC-only until 60 profitable days, then
+    # flip this to false to trade the whole scanned universe.
+    crypto_btc_only: bool = Field(True, validation_alias="CRYPTO_BTC_ONLY")
+
+    # --- Stock Universe ---
+    # Optional comma-separated ticker override (e.g. "AAPL,MSFT,NVDA").
+    # Blank = full built-in S&P 500 list (data/sp500.py) on the Alpaca path.
+    stock_universe: str = Field("", validation_alias="STOCK_UNIVERSE")
 
     # --- Stock Strategy Params ---
     stock_stop_loss: float = 0.05

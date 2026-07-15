@@ -91,13 +91,13 @@ def _unpaused():
 
 # --------------------------- registration ---------------------------
 
-def test_eight_jobs_registered():
+def test_nine_jobs_registered():
     sched = S.build_scheduler()
     ids = sorted(j.id for j in sched.get_jobs())
     assert ids == sorted([
         "sunday_stock_scan", "sunday_ml_retrain", "monday_stock_buys",
         "midweek_stock_monitor", "friday_stock_sells", "crypto_cycle",
-        "weekly_performance_report", "daily_heartbeat",
+        "crypto_stop_monitor", "weekly_performance_report", "daily_heartbeat",
     ])
 
 
@@ -119,6 +119,39 @@ def test_stock_triggers_match_strategy():
 def test_crypto_trigger_is_4h():
     sched = S.build_scheduler()
     assert "hour='*/4'" in _trigger_str(sched, "crypto_cycle")
+
+
+def test_crypto_stop_monitor_is_15m():
+    sched = S.build_scheduler()
+    assert "minute='*/15'" in _trigger_str(sched, "crypto_stop_monitor")
+
+
+def test_crypto_stop_monitor_closes_breached(monkeypatch):
+    ex = FakeExecutor()
+    positions = [
+        FakePos("BTC/USD", 0.001, 61000.0, stop_loss=58000.0),   # breached at 57500
+        FakePos("ETH/USD", 0.01, 3000.0, stop_loss=2800.0),      # safe at 2900
+    ]
+    monkeypatch.setattr(S.db, "get_open_positions", lambda a: positions, raising=False)
+    monkeypatch.setattr(S.db, "update_position_marks", lambda p: 0, raising=False)
+    monkeypatch.setattr(S, "_latest_crypto_prices",
+                        lambda syms: {"BTC/USD": 57500.0, "ETH/USD": 2900.0})
+    monkeypatch.setattr(S, "crypto_executor_from_settings", lambda paper=None: ex)
+    S.crypto_stop_monitor()
+    assert ex.closed == [("BTC/USD", 57500.0, "stop_loss")]
+
+
+def test_crypto_stop_monitor_runs_while_paused(monkeypatch):
+    """Risk-reducing job: the UI pause must never suppress it."""
+    ex = FakeExecutor()
+    positions = [FakePos("BTC/USD", 0.001, 61000.0, stop_loss=58000.0)]
+    monkeypatch.setattr(S.db, "get_open_positions", lambda a: positions, raising=False)
+    monkeypatch.setattr(S.db, "update_position_marks", lambda p: 0, raising=False)
+    monkeypatch.setattr(S, "_latest_crypto_prices", lambda syms: {"BTC/USD": 57000.0})
+    monkeypatch.setattr(S, "crypto_executor_from_settings", lambda paper=None: ex)
+    bot_state.pause()
+    S.crypto_stop_monitor()
+    assert len(ex.closed) == 1
 
 
 def test_jobs_dict_exposes_every_registered_job():

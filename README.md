@@ -30,8 +30,8 @@ equity curve, open positions, trades, signals, and every scheduled job with a
 The only required configuration is `ALPACA_API_KEY` / `ALPACA_SECRET_KEY`.
 With nothing else set, the bot uses a local SQLite database, logs alerts
 instead of sending Telegram messages, and pulls stock data from Alpaca's free
-IEX feed over a ~55-name large-cap universe (add a Polygon key to scan the
-full S&P 500).
+IEX feed over the full built-in S&P 500 list (a Polygon key switches to live
+index constituents; `STOCK_UNIVERSE` overrides with your own tickers).
 
 ### Docker
 
@@ -77,6 +77,7 @@ Everything lives in `.env` (see `.env.example` for the full list):
 | Mid-week stop-loss monitor | Mon–Fri, every 30 min, 09:00–16:30 |
 | Friday stock sells | Fri 15:45 |
 | Crypto trend cycle | every 4 hours, 24/7 |
+| Crypto stop monitor | every 15 min, 24/7 (only calls out while positions are open) |
 | Weekly P&L report | Fri 16:30 |
 | Daily heartbeat | 08:00 |
 
@@ -84,7 +85,10 @@ Everything lives in `.env` (see `.env.example` for the full list):
 
 - Fixed-fractional risk per trade (2% stocks / 1.5% crypto), capped by
   half-Kelly — a weak edge shrinks positions, never enlarges them.
-- Portfolio heat caps, per-position notional caps, $50 minimum position.
+- Portfolio heat caps, per-position notional caps, and a minimum position
+  floor that adapts to account size (`MIN_POSITION_SIZE`, capped at 10% of
+  equity, never below $10) so small accounts aren't locked out.
+- Crypto stops are re-checked every 15 minutes between the 4-hour cycles.
 - Monthly drawdown circuit breaker: −15% halts all new entries.
 - **Pause button** in the dashboard stops new entries instantly; stop-loss
   monitoring and scheduled exits keep running so open positions stay

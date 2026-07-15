@@ -303,3 +303,70 @@ def test_recent_trades_ordering(mem_db):
     _seed(mem_db)
     rows = dbmod.get_recent_trades(limit=10)
     assert len(rows) == 2
+
+
+# =============================================================================
+# adaptive minimum position floor
+# =============================================================================
+
+def test_effective_min_position_scales_with_equity():
+    from risk.manager import effective_min_position
+    assert effective_min_position(10_000, 50.0) == 50.0     # big account: unchanged
+    assert effective_min_position(229.81, 50.0) == pytest.approx(22.981)  # 10% of equity
+    assert effective_min_position(50.0, 50.0) == 10.0       # hard $10 floor
+    assert effective_min_position(0, 50.0) == 50.0          # unknown equity: configured
+
+
+def test_small_account_can_size_a_position():
+    """A $230 account with a 5% stop must produce a tradable position - the
+    old fixed $50 floor plus haircuts used to lock small accounts out."""
+    from risk.manager import size_position, stock_params
+    ps = size_position(
+        stock_params(), equity=229.81, available_cash=229.81,
+        entry_price=100.0, stop_price=95.0,
+    )
+    assert ps.tradable
+    assert ps.notional >= 22.9
+
+
+def test_executor_floor_is_instance_configurable(mem_db):
+    from execution.alpaca_crypto import AlpacaCryptoExecutor
+    ex = AlpacaCryptoExecutor(paper=True, paper_cash=230.0)
+    ex.min_position_usd = 23.0
+    r = ex.open_long("BTC/USD", units=0.0005, entry_price=60000.0,   # $30 notional
+                     stop_loss=57000.0, take_profit=66000.0)
+    assert r["status"] == "filled"
+
+
+# =============================================================================
+# stock universe
+# =============================================================================
+
+def test_default_stock_universe_is_full_sp500(monkeypatch):
+    import data.alpaca_data as ad
+    monkeypatch.setattr(ad.settings, "stock_universe", "", raising=False)
+    universe = ad.default_stock_universe()
+    assert len(universe) > 450
+    assert "AAPL" in universe and "BRK.B" in universe
+
+
+def test_stock_universe_env_override(monkeypatch):
+    import data.alpaca_data as ad
+    monkeypatch.setattr(ad.settings, "stock_universe", "aapl, msft ,NVDA", raising=False)
+    assert ad.default_stock_universe() == ["AAPL", "MSFT", "NVDA"]
+
+
+# =============================================================================
+# pause persistence
+# =============================================================================
+
+def test_pause_state_survives_restart(tmp_path, monkeypatch):
+    import runtime.state as rs
+    monkeypatch.setattr(rs, "_state_file", lambda: tmp_path / "bot_state.json")
+    first = rs.BotState()
+    assert first.paused is False
+    first.pause()
+    reborn = rs.BotState()           # simulates a process restart
+    assert reborn.paused is True
+    reborn.resume()
+    assert rs.BotState().paused is False
