@@ -284,6 +284,15 @@ def test_unknown_job_404(client):
     assert client.post("/api/jobs/not_a_job/run").status_code == 404
 
 
+def test_naive_timestamps_serialized_as_utc(client):
+    """SQLite hands back naive datetimes; the API must stamp them UTC so the
+    browser converts to the viewer's local time instead of misreading them."""
+    trades = client.get("/api/trades").json()
+    assert trades, "seeded trades expected"
+    for t in trades:
+        assert t["opened_at"].endswith("+00:00") or t["opened_at"].endswith("Z")
+
+
 # =============================================================================
 # database helpers
 # =============================================================================

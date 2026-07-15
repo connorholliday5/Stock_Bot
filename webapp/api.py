@@ -48,6 +48,11 @@ def _iso(dt) -> Optional[str]:
     if dt is None:
         return None
     try:
+        # SQLite returns naive datetimes even for timezone-aware columns; all
+        # bot writes are UTC, so stamp naive values as UTC. Without the offset
+        # the browser parses them as *local* time and shows times hours off.
+        if getattr(dt, "tzinfo", None) is None and hasattr(dt, "replace"):
+            dt = dt.replace(tzinfo=UTC)
         return dt.isoformat()
     except Exception:
         return str(dt)
