@@ -173,14 +173,15 @@ def test_account_state_static_reconstruct(monkeypatch):
     assert len(st.open_positions) == 2
 
 
-def test_account_state_broker_cash_passthrough(monkeypatch):
+def test_account_state_broker_cash_buffered(monkeypatch):
     rm = FakeRM(nav=999.0)
     monkeypatch.setattr(S.db, "get_open_positions", lambda a: [], raising=False)
     snap = AccountSnapshot(equity=229.81, cash=120.55, source="broker")
     monkeypatch.setattr(S, "get_account_snapshot", lambda rm=None, force=False: snap)
     st = S.get_account_state(rm, "stock")
     assert st.equity == pytest.approx(229.81)   # the money in the Alpaca account
-    assert st.cash == pytest.approx(120.55)
+    # sizing cash is held back 1% so real fills can't trip buying-power errors
+    assert st.cash == pytest.approx(120.55 * (1.0 - S.BROKER_CASH_BUFFER))
 
 
 # --------------------------- halt gating ---------------------------

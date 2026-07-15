@@ -125,8 +125,15 @@ class AlpacaCryptoExecutor(CryptoExecutor):
             logger.error("crypto submit_order failed for {} {}: {}", side, symbol, exc)
             return {"price": 0.0, "units": 0.0, "fee": 0.0, "status": "rejected"}
 
+        from execution.alpaca import await_order_fill
+        order = await_order_fill(self.client, order)
         price = float(getattr(order, "filled_avg_price", None) or ref_price)
-        filled = float(getattr(order, "filled_qty", None) or units)
+        filled = float(getattr(order, "filled_qty", 0) or 0)
+        if filled <= 0:
+            logger.warning("crypto order {} {} not filled within poll window; "
+                           "recording submitted qty", side, symbol)
+            filled = units
+            price = ref_price
         fee = price * filled * self.fee_rate
         return {"price": price, "units": filled, "fee": fee, "status": "filled"}
 

@@ -265,12 +265,18 @@ def size_position(
         notional = max_notional
         units = notional / eff_entry
 
-    # No margin: cannot deploy more than available cash net of fee/slippage buffer.
-    if available_cash > 0:
-        cash_ceiling = available_cash / (1.0 + max(0.0, params.fee_rate))
-        if notional > cash_ceiling:
-            notional = cash_ceiling
-            units = notional / eff_entry
+    # No margin: cannot deploy more than available cash net of fee/slippage
+    # buffer. Zero (or negative) cash means zero budget - it must NEVER mean
+    # "uncapped": that exact bug sized full positions after earlier entries in
+    # the same batch had consumed the cash, and the broker rejected them all.
+    if available_cash <= 0:
+        return PositionSize(0.0, 0.0, effective_risk_pct, final_stop, take_profit,
+                            "no_cash")
+    cash_ceiling = available_cash / (1.0 + max(0.0, params.fee_rate)
+                                     + max(0.0, params.slippage_pct))
+    if notional > cash_ceiling:
+        notional = cash_ceiling
+        units = notional / eff_entry
 
     if notional < effective_min_position(equity, params.min_position_usd):
         return PositionSize(0.0, notional, effective_risk_pct, final_stop, take_profit,

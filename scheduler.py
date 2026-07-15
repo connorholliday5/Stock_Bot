@@ -115,12 +115,18 @@ def _invested(open_positions: list) -> float:
     return total
 
 
+# Fraction of broker cash held back when sizing, so a real fill a few cents
+# above the sizing reference can never trip "insufficient buying power".
+BROKER_CASH_BUFFER = 0.01
+
+
 def get_account_state(rm: RiskManager, asset_type: str) -> AccountState:
     """Equity/cash for sizing. Broker snapshot when configured; DB fallback."""
     positions = _open_positions(asset_type)
     snap = get_account_snapshot(rm)
     if snap.source == "broker":
-        return AccountState(equity=snap.equity, cash=max(0.0, snap.cash),
+        return AccountState(equity=snap.equity,
+                            cash=max(0.0, snap.cash * (1.0 - BROKER_CASH_BUFFER)),
                             open_positions=positions)
     cash = max(0.0, snap.equity - _invested(positions))
     return AccountState(equity=snap.equity, cash=cash, open_positions=positions)

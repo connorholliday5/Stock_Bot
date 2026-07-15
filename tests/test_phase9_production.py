@@ -284,6 +284,72 @@ def test_unknown_job_404(client):
     assert client.post("/api/jobs/not_a_job/run").status_code == 404
 
 
+def test_zero_cash_means_zero_budget():
+    """available_cash=0 must gate the trade, never disable the cash ceiling.
+    (Observed live: after a batch consumed the cash, remaining hit exactly 0
+    and follow-on entries were sized FULL - broker rejected them all.)"""
+    from risk.manager import size_position, stock_params
+    ps = size_position(stock_params(), equity=10_000, available_cash=0.0,
+                       entry_price=100.0, stop_price=95.0)
+    assert not ps.tradable
+    assert ps.reason == "no_cash"
+
+
+class _PendingThenFilledClient:
+    """Mimics Alpaca: submit returns 'accepted' filled_qty=0; polling the
+    order returns the real fill."""
+
+    def __init__(self, fill_qty=0.38, fill_price=228.59, fills_after=1):
+        import types
+        self._pending = types.SimpleNamespace(
+            id="ord-1", status="accepted", filled_qty="0", filled_avg_price=None)
+        self._filled = types.SimpleNamespace(
+            id="ord-1", status="filled",
+            filled_qty=str(fill_qty), filled_avg_price=str(fill_price))
+        self._fills_after = fills_after
+        self.polls = 0
+
+    def submit_order(self, req):
+        return self._pending
+
+    def get_order_by_id(self, order_id):
+        self.polls += 1
+        return self._filled if self.polls >= self._fills_after else self._pending
+
+
+def test_order_fill_is_polled_not_trusted(mem_db, monkeypatch):
+    """The qty-0 phantom-position bug: the executor must poll until the order
+    fills instead of recording the instant 'accepted' snapshot."""
+    import execution.alpaca as ea
+    monkeypatch.setattr(ea, "FILL_POLL_INTERVAL_S", 0.0)
+    ex = ea.StockExecutor(paper=False, client=_PendingThenFilledClient())
+    ex.min_position_usd = 10.0
+    r = ex.open_long("MS", units=0.38, entry_price=228.24,
+                     stop_loss=216.86, take_profit=251.0)
+    assert r["status"] == "filled"
+    assert r["units"] == pytest.approx(0.38)          # real fill qty, not 0
+    assert r["price"] == pytest.approx(228.59)        # real fill price
+    s = mem_db()
+    pos = s.query(Position).filter_by(symbol="MS").one()
+    assert pos.quantity == pytest.approx(0.38)
+    s.close()
+
+
+def test_unfilled_order_falls_back_to_submitted_qty(mem_db, monkeypatch):
+    """After-hours orders queue unfilled; record submitted qty at ref price
+    rather than a qty-0 phantom."""
+    import execution.alpaca as ea
+    monkeypatch.setattr(ea, "FILL_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ea, "FILL_POLL_ATTEMPTS", 2)
+    client = _PendingThenFilledClient(fills_after=99)   # never fills in window
+    ex = ea.StockExecutor(paper=False, client=client)
+    ex.min_position_usd = 10.0
+    r = ex.open_long("MS", units=0.38, entry_price=228.24,
+                     stop_loss=216.86, take_profit=251.0)
+    assert r["units"] == pytest.approx(0.38)
+    assert r["price"] == pytest.approx(228.24)
+
+
 def test_naive_timestamps_serialized_as_utc(client):
     """SQLite hands back naive datetimes; the API must stamp them UTC so the
     browser converts to the viewer's local time instead of misreading them."""
