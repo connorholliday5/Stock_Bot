@@ -164,6 +164,7 @@ def test_jobs_dict_exposes_every_registered_job():
 def test_account_state_static_reconstruct(monkeypatch):
     rm = FakeRM(nav=1000.0)
     positions = [FakePos("AAPL", 2, 100.0, 110.0), FakePos("MSFT", 1, 50.0, None)]
+    monkeypatch.setattr(S.settings, "crypto_allocation_pct", 0.0, raising=False)
     monkeypatch.setattr(S.db, "get_open_positions", lambda a: positions, raising=False)
     monkeypatch.setattr(S, "get_account_snapshot", lambda rm=None, force=False: _static_snap(1000.0))
     st = S.get_account_state(rm, "stock")
@@ -208,6 +209,7 @@ def test_crypto_blocked_when_halted(monkeypatch):
 
 def test_pause_blocks_entry_jobs_only(monkeypatch):
     called = {"buys": 0, "sells": 0}
+    monkeypatch.setattr(S.settings, "stock_exit_mode", "liquidate", raising=False)
     monkeypatch.setattr(S, "build_risk_manager", lambda: FakeRM())
     monkeypatch.setattr(S.stock_weekly, "run_stock_weekly_buys",
                         lambda **k: called.__setitem__("buys", called["buys"] + 1))
@@ -236,6 +238,7 @@ def test_monday_buys_dispatch_contract(monkeypatch):
     scored = pd.DataFrame({"ticker": ["AAPL", "MSFT", "NVDA"], "score": [3, 2, 1]})
     universe = {"AAPL": _df(), "MSFT": _df(), "NVDA": _df()}
 
+    monkeypatch.setattr(S.settings, "crypto_allocation_pct", 0.0, raising=False)
     monkeypatch.setattr(S, "build_risk_manager", lambda: rm)
     monkeypatch.setattr(S.db, "get_latest_scored_universe", lambda: scored, raising=False)
     monkeypatch.setattr(S.db, "get_open_positions", lambda a: [], raising=False)
@@ -266,6 +269,7 @@ def test_monday_buys_skips_without_scan(monkeypatch):
 def test_friday_sells_dispatch(monkeypatch):
     positions = [FakePos("AAPL", 2, 100.0, 105.0)]
     captured = {}
+    monkeypatch.setattr(S.settings, "stock_exit_mode", "liquidate", raising=False)
     monkeypatch.setattr(S, "build_risk_manager", lambda: FakeRM())
     monkeypatch.setattr(S.db, "get_open_positions", lambda a: positions, raising=False)
     monkeypatch.setattr(S, "_load_stock_frames",
@@ -283,6 +287,7 @@ def test_friday_sells_dispatch(monkeypatch):
 def test_friday_sells_synthesizes_mark_when_data_missing(monkeypatch):
     positions = [FakePos("AAPL", 2, 100.0, 103.0)]
     captured = {}
+    monkeypatch.setattr(S.settings, "stock_exit_mode", "liquidate", raising=False)
     monkeypatch.setattr(S, "build_risk_manager", lambda: FakeRM())
     monkeypatch.setattr(S.db, "get_open_positions", lambda a: positions, raising=False)
     monkeypatch.setattr(S, "_load_stock_frames", lambda tickers, lookback_days=90: {})
@@ -310,8 +315,60 @@ def test_crypto_dispatch_contract(monkeypatch):
     assert captured["universe"] is universe              # dict of DataFrames
     assert captured["funding_rates"] == {}               # alpaca spot: no funding
     assert captured["risk_manager"] is rm
-    assert captured["available_cash"] == 1000.0
     assert captured["btc_only"] is True
+    assert captured["entry_mode"] == "regime"            # posture-based default
+    # crypto book budget = 25% of equity under the default allocation
+    assert captured["available_cash"] == pytest.approx(250.0)
+
+
+def test_friday_rotation_sells_only_laggards(monkeypatch):
+    import pandas as pd
+    positions = [FakePos("AAPL", 2, 100.0, 105.0),   # still ranked -> hold
+                 FakePos("XYZ", 1, 50.0, 48.0)]      # fell out -> sell
+    ranked = pd.DataFrame({"ticker": ["AAPL", "MSFT", "NVDA"], "composite": [3, 2, 1]})
+    captured = {}
+    monkeypatch.setattr(S.settings, "stock_exit_mode", "rotate", raising=False)
+    monkeypatch.setattr(S, "build_risk_manager", lambda: FakeRM())
+    monkeypatch.setattr(S.db, "get_open_positions", lambda a: positions, raising=False)
+    monkeypatch.setattr(S, "_load_feature_universe", lambda: {"AAPL": _df(105.0)})
+    monkeypatch.setattr(S, "_score_and_persist", lambda universe: ranked)
+    monkeypatch.setattr(S.StockExecutor, "from_settings", classmethod(lambda cls: FakeExecutor()))
+    monkeypatch.setattr(S.stock_weekly, "run_stock_weekly_sells",
+                        lambda **k: captured.update(k) or None)
+    S.friday_stock_sells()
+    sold = [p["symbol"] for p in captured["open_positions"]]
+    assert sold == ["XYZ"]
+
+
+def test_friday_rotation_holds_all_when_scan_fails(monkeypatch):
+    positions = [FakePos("AAPL", 2, 100.0, 105.0)]
+    called = {"sells": 0}
+    monkeypatch.setattr(S.settings, "stock_exit_mode", "rotate", raising=False)
+    monkeypatch.setattr(S, "build_risk_manager", lambda: FakeRM())
+    monkeypatch.setattr(S.db, "get_open_positions", lambda a: positions, raising=False)
+    monkeypatch.setattr(S, "_load_feature_universe", lambda: {})
+    monkeypatch.setattr(S.stock_weekly, "run_stock_weekly_sells",
+                        lambda **k: called.__setitem__("sells", called["sells"] + 1))
+    S.friday_stock_sells()
+    assert called["sells"] == 0      # data glitch must not dump the book
+
+
+def test_crypto_allocation_reserves_budget(monkeypatch):
+    """Stocks capped at (1-pct)*equity; crypto keeps its pct*equity slice."""
+    rm = FakeRM(nav=1000.0)
+    monkeypatch.setattr(S.settings, "crypto_allocation_pct", 0.25, raising=False)
+    monkeypatch.setattr(S.db, "get_open_positions",
+                        lambda a: [] if a == "crypto"
+                        else [FakePos("AAPL", 5, 100.0, 100.0)],
+                        raising=False)
+    snap = AccountSnapshot(equity=1000.0, cash=500.0, source="broker")
+    monkeypatch.setattr(S, "get_account_snapshot", lambda rm=None, force=False: snap)
+    stock = S.get_account_state(rm, "stock")
+    crypto = S.get_account_state(rm, "crypto")
+    # stock budget: 750 - 500 invested = 250 (below buffered cash 495)
+    assert stock.cash == pytest.approx(250.0)
+    # crypto budget: 250 - 0 invested (below buffered cash 495)
+    assert crypto.cash == pytest.approx(250.0)
 
 
 def test_crypto_cycle_executes_plans(monkeypatch):

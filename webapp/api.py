@@ -153,6 +153,11 @@ def create_app(scheduler=None) -> FastAPI:
             "execution_mode": settings.execution_mode,
             "capital_source": settings.capital_source,
             "crypto_exchange": settings.crypto_exchange,
+            "stock_exit_mode": getattr(settings, "stock_exit_mode", "rotate"),
+            "crypto_entry_mode": getattr(settings, "crypto_entry_mode", "regime"),
+            "crypto_btc_only": bool(getattr(settings, "crypto_btc_only", True)),
+            "crypto_allocation_pct": float(getattr(settings, "crypto_allocation_pct", 0.0) or 0.0),
+            "rotation_keep_rank": int(getattr(settings, "rotation_keep_rank", 20)),
             "paused": bot_state.paused,
             "halted": halted,
             "started_at": bot_state.started_at.isoformat(),
@@ -165,6 +170,14 @@ def create_app(scheduler=None) -> FastAPI:
     def account() -> dict:
         snap = get_account_snapshot()
         positions = db.get_open_positions()
+
+        def _invested(rows) -> float:
+            total = 0.0
+            for p in rows:
+                mark = getattr(p, "current_price", None) or getattr(p, "entry_price", 0.0)
+                total += float(getattr(p, "quantity", 0.0) or 0.0) * float(mark or 0.0)
+            return total
+
         stock = [p for p in positions
                  if str(getattr(getattr(p, "asset_type", None), "value", "")) == "stock"]
         crypto = [p for p in positions
@@ -173,6 +186,8 @@ def create_app(scheduler=None) -> FastAPI:
             **snap.as_dict(),
             "open_stock_positions": len(stock),
             "open_crypto_positions": len(crypto),
+            "stock_invested": round(_invested(stock), 2),
+            "crypto_invested": round(_invested(crypto), 2),
         }
 
     @app.get("/api/positions")

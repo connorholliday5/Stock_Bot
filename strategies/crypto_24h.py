@@ -199,6 +199,24 @@ def bullish_ema_cross(df: pd.DataFrame, lookback: int = EMA_CROSS_LOOKBACK) -> b
     return bool(crossed)
 
 
+def ema_stacked_bullish(df: pd.DataFrame) -> bool:
+    """True while EMA9 sits above EMA21 on the last bar - the POSTURE test.
+
+    Unlike bullish_ema_cross this does not demand the crossing moment
+    happened within the last few bars, so a bot starting (or re-entering)
+    mid-trend still participates. Used by CRYPTO_ENTRY_MODE=regime.
+    """
+    if df is None or df.empty:
+        return False
+    if "ema_9" not in df.columns or "ema_21" not in df.columns:
+        return False
+    ema9 = df["ema_9"].iloc[-1]
+    ema21 = df["ema_21"].iloc[-1]
+    if pd.isna(ema9) or pd.isna(ema21):
+        return False
+    return bool(ema9 > ema21)
+
+
 def bearish_ema_cross(df: pd.DataFrame) -> bool:
     """True if EMA9 is at or below EMA21 on the last bar (trend turned down)."""
     if df is None or df.empty:
@@ -210,6 +228,20 @@ def bearish_ema_cross(df: pd.DataFrame) -> bool:
     if pd.isna(ema9) or pd.isna(ema21):
         return False
     return bool(ema9 <= ema21)
+
+
+def macd_positive(df: pd.DataFrame) -> bool:
+    """True while MACD sits in positive territory - the POSTURE confirmation.
+
+    macd_confirms_long (macd > signal AND hist > 0) demands *accelerating*
+    momentum; in a steady established trend MACD hugs its signal line and the
+    histogram oscillates around zero, so that test flaps. A posture entry
+    only needs the trend to be up, which positive MACD expresses.
+    """
+    if df is None or df.empty or "macd" not in df.columns:
+        return False
+    macd = df["macd"].iloc[-1]
+    return bool(pd.notna(macd) and macd > 0)
 
 
 def macd_confirms_long(df: pd.DataFrame) -> bool:
@@ -392,8 +424,17 @@ def generate_24h_entries(
     win_rate: float = DEFAULT_WIN_RATE,
     win_loss_ratio: float = DEFAULT_WIN_LOSS_RATIO,
     risk_manager: Optional[RiskManager] = None,
+    entry_mode: str = "cross",
 ) -> list[CryptoEntryPlan]:
-    """Evaluate every symbol and return sizeable, gated long entry plans."""
+    """Evaluate every symbol and return sizeable, gated long entry plans.
+
+    entry_mode:
+      "cross"  - legacy: requires a FRESH EMA9/21 cross within 3 bars plus a
+                 1.5x volume spike. Precise but misses trends already running.
+      "regime" - posture: long while the trend is intact (EMA9>EMA21, price
+                 above EMA200, ADX trending, MACD positive). Enters mid-trend;
+                 volume gate relaxed to average.
+    """
     held = {_position_symbol(p) for p in open_positions}
     open_count = len(held)
     plans: list[CryptoEntryPlan] = []
@@ -427,12 +468,20 @@ def generate_24h_entries(
         if regime != MarketRegime.TRENDING:
             logger.debug("%s: regime %s not tradable for trend entry", symbol, regime.value)
             continue
-        if not bullish_ema_cross(df):
-            continue
-        if not macd_confirms_long(df):
-            continue
-        if _last_float(df, "volume_ratio", 0.0) < VOLUME_SPIKE_MIN:
-            continue
+        if entry_mode == "regime":
+            if not ema_stacked_bullish(df):
+                continue
+            if not macd_positive(df):
+                continue
+            if _last_float(df, "volume_ratio", 0.0) < 1.0:
+                continue
+        else:
+            if not bullish_ema_cross(df):
+                continue
+            if not macd_confirms_long(df):
+                continue
+            if _last_float(df, "volume_ratio", 0.0) < VOLUME_SPIKE_MIN:
+                continue
 
         entry_price = _last_float(df, "close")
         atr = _last_float(df, "atr")
@@ -478,8 +527,15 @@ def generate_24h_exits(
     open_positions: list[dict],
     universe: dict[str, pd.DataFrame],
     atr_stop_mult: float = ATR_STOP_MULT,
+    entry_mode: str = "cross",
 ) -> list[CryptoExitPlan]:
-    """Return exit plans for held positions whose trend has broken down."""
+    """Return exit plans for held positions whose trend has broken down.
+
+    In "regime" mode the MACD-histogram-negative exit is dropped: a posture
+    position rides the trend until the trend itself breaks (EMA structure or
+    stop); a single negative MACD bar mid-uptrend is noise, and exiting on it
+    pays the 0.5% round-trip fee for nothing.
+    """
     plans: list[CryptoExitPlan] = []
 
     for pos in open_positions:
@@ -502,7 +558,8 @@ def generate_24h_exits(
             reason = "below_ema200"
         elif bearish_ema_cross(df):
             reason = "ema_bearish_cross"
-        elif "macd_hist" in df.columns and pd.notna(df["macd_hist"].iloc[-1]) and df["macd_hist"].iloc[-1] < 0:
+        elif (entry_mode != "regime" and "macd_hist" in df.columns
+              and pd.notna(df["macd_hist"].iloc[-1]) and df["macd_hist"].iloc[-1] < 0):
             reason = "macd_hist_negative"
         else:
             # ATR trailing stop: prefer the stored stop_loss, else derive from entry.
@@ -535,6 +592,7 @@ def run_crypto_24h_pipeline(
     win_rate: float = DEFAULT_WIN_RATE,
     win_loss_ratio: float = DEFAULT_WIN_LOSS_RATIO,
     risk_manager: Optional[RiskManager] = None,
+    entry_mode: str = "cross",
 ) -> CryptoCycleResult:
     """
     Full 24/7 crypto decision cycle. Exits are evaluated first (free up slots),
@@ -543,11 +601,12 @@ def run_crypto_24h_pipeline(
 
     Pass a RiskManager to enforce the monthly drawdown halt and shared portfolio
     heat; omit it (default) for the Phase 4 standalone behavior.
+    entry_mode: "cross" (legacy fresh-cross gate) or "regime" (trend posture).
     """
     funding_rates = funding_rates or {}
     open_positions = open_positions or []
 
-    exits = generate_24h_exits(open_positions, universe)
+    exits = generate_24h_exits(open_positions, universe, entry_mode=entry_mode)
     exiting_symbols = {e.symbol for e in exits}
     remaining_positions = [p for p in open_positions if _position_symbol(p) not in exiting_symbols]
 
@@ -561,6 +620,7 @@ def run_crypto_24h_pipeline(
         win_rate=win_rate,
         win_loss_ratio=win_loss_ratio,
         risk_manager=risk_manager,
+        entry_mode=entry_mode,
     )
 
     persisted = 0

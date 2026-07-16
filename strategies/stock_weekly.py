@@ -297,6 +297,43 @@ def run_stock_weekly_buys(
     return StockCycleResult(entries=entries, exits=[], executed=executed, persisted=persisted)
 
 
+def select_rotation_exits(
+    open_positions: list[dict],
+    ranked_df: pd.DataFrame,
+    keep_rank: int = 20,
+) -> list[dict]:
+    """ROTATION exit rule: sell only positions that fell OUT of the fresh
+    rankings; positions still inside the top `keep_rank` keep riding.
+
+    This replaces the Friday liquidate-everything rule: momentum pays over
+    weeks, and forced weekly exits amputate winners while re-entry costs
+    spread/slippage every Monday. Stops still protect every held position.
+
+    Fail-safe: with no usable ranking (scan failed), HOLD everything - the
+    stop-loss layer keeps protecting, and dumping the whole book on a data
+    glitch is the worse failure mode.
+    """
+    if ranked_df is None or len(ranked_df) == 0:
+        logger.warning("rotation: no fresh ranking available - holding all %d positions",
+                       len(open_positions))
+        return []
+    cols = list(getattr(ranked_df, "columns", []))
+    key = "ticker" if "ticker" in cols else ("symbol" if "symbol" in cols else None)
+    if key is None:
+        logger.warning("rotation: ranking has no ticker column - holding all positions")
+        return []
+    keep = set(ranked_df[key].head(max(1, int(keep_rank))))
+    exits = []
+    for pos in open_positions:
+        symbol = pos.get("ticker") or pos.get("symbol") or ""
+        if symbol not in keep:
+            exits.append(pos)
+            logger.info("rotation: %s fell out of top %d - selling", symbol, keep_rank)
+        else:
+            logger.info("rotation: %s still ranked - holding", symbol)
+    return exits
+
+
 def run_stock_weekly_sells(
     open_positions: list[dict],
     universe: dict[str, pd.DataFrame],

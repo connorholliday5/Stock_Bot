@@ -120,15 +120,37 @@ def _invested(open_positions: list) -> float:
 BROKER_CASH_BUFFER = 0.01
 
 
+def _allocation_cap(asset_type: str, equity: float) -> Optional[float]:
+    """Remaining budget for this book under CRYPTO_ALLOCATION_PCT.
+
+    With a reservation configured (> 0), crypto may deploy at most
+    pct*equity and stocks at most (1-pct)*equity, so Monday's stock buys can
+    never starve the crypto book of cash (observed live: stocks took 99% of
+    the account and BTC had $2.31 to trade with all week). None = no cap.
+    """
+    pct = float(getattr(settings, "crypto_allocation_pct", 0.0) or 0.0)
+    if pct <= 0 or equity <= 0:
+        return None
+    pct = min(pct, 1.0)
+    if asset_type == "crypto":
+        budget = equity * pct - _invested(_open_positions("crypto"))
+    else:
+        budget = equity * (1.0 - pct) - _invested(_open_positions("stock"))
+    return max(0.0, budget)
+
+
 def get_account_state(rm: RiskManager, asset_type: str) -> AccountState:
-    """Equity/cash for sizing. Broker snapshot when configured; DB fallback."""
+    """Equity/cash for sizing. Broker snapshot when configured; DB fallback.
+    Cash is additionally capped by the per-book allocation budget."""
     positions = _open_positions(asset_type)
     snap = get_account_snapshot(rm)
     if snap.source == "broker":
-        return AccountState(equity=snap.equity,
-                            cash=max(0.0, snap.cash * (1.0 - BROKER_CASH_BUFFER)),
-                            open_positions=positions)
-    cash = max(0.0, snap.equity - _invested(positions))
+        cash = max(0.0, snap.cash * (1.0 - BROKER_CASH_BUFFER))
+    else:
+        cash = max(0.0, snap.equity - _invested(positions))
+    cap = _allocation_cap(asset_type, snap.equity)
+    if cap is not None:
+        cash = min(cash, cap)
     return AccountState(equity=snap.equity, cash=cash, open_positions=positions)
 
 
@@ -281,6 +303,18 @@ def _guarded(job_id: str):
 # JOBS
 # ============================================================
 
+def _score_and_persist(universe: dict):
+    """Score a feature universe (rule + optional ML blend) and persist the
+    ranking. Shared by the Sunday scan and the Friday rotation (which needs a
+    FRESH ranking to decide what still deserves its slot)."""
+    ml_scorer = _load_ml_scorer()
+    ml_weight = stock_scorer.DEFAULT_ML_WEIGHT if ml_scorer is not None else 0.0
+    result = stock_scorer.score_universe(universe, ml_scorer=ml_scorer, ml_weight=ml_weight)
+    ranked = getattr(result, "ranked", result)
+    db.persist_scored_universe(ranked)
+    return ranked
+
+
 @_guarded("sunday_stock_scan")
 def sunday_stock_scan() -> None:
     logger.info("sunday_stock_scan: scoring stock universe")
@@ -288,14 +322,9 @@ def sunday_stock_scan() -> None:
     if not universe:
         logger.warning("sunday_stock_scan: empty feature universe. Skipping scan.")
         return
-    ml_scorer = _load_ml_scorer()
-    ml_weight = stock_scorer.DEFAULT_ML_WEIGHT if ml_scorer is not None else 0.0
-    result = stock_scorer.score_universe(universe, ml_scorer=ml_scorer, ml_weight=ml_weight)
-    ranked = getattr(result, "ranked", result)
-    db.persist_scored_universe(ranked)
+    ranked = _score_and_persist(universe)
     n = 0 if ranked is None else len(ranked)
-    logger.info("sunday_stock_scan: persisted {} scored symbols (ml_blend={})",
-                n, ml_scorer is not None)
+    logger.info("sunday_stock_scan: persisted {} scored symbols", n)
     return f"scored={n}"
 
 
@@ -388,16 +417,9 @@ def midweek_stock_monitor() -> None:
     return f"marks={len(prices)} closed={closed}"
 
 
-@_guarded("friday_stock_sells")
-def friday_stock_sells() -> None:
-    positions = _open_positions("stock")
-    if not positions:
-        logger.info("friday_stock_sells: no open stock positions.")
-        return "no open positions"
-    symbols = [getattr(p, "symbol", "") for p in positions if getattr(p, "symbol", "")]
-    universe = _load_stock_frames(symbols, lookback_days=90)
-    # Fallback marks so an exit is never priced at 0 when data is missing:
-    # synthesize a one-row frame from the last known mark (or entry).
+def _synthesize_missing_marks(universe: dict, positions: list) -> dict:
+    """Fallback marks so an exit is never priced at 0 when data is missing:
+    synthesize a one-row frame from the last known mark (or entry)."""
     import pandas as pd
     for p in positions:
         symbol = getattr(p, "symbol", "")
@@ -406,6 +428,49 @@ def friday_stock_sells() -> None:
                          or getattr(p, "entry_price", 0.0) or 0.0)
             if mark > 0:
                 universe[symbol] = pd.DataFrame({"close": [mark]})
+    return universe
+
+
+@_guarded("friday_stock_sells")
+def friday_stock_sells() -> None:
+    """Friday 3:45 exit pass. Two modes (STOCK_EXIT_MODE):
+
+    rotate (default) - re-score the universe NOW and sell only positions
+      that fell out of the top ROTATION_KEEP_RANK; still-ranked winners ride
+      into next week (stop-losses keep protecting them, weekends included via
+      Monday-morning marks). Cuts turnover and lets momentum compound.
+    liquidate - legacy: sell everything, flat over the weekend.
+    """
+    positions = _open_positions("stock")
+    if not positions:
+        logger.info("friday_stock_sells: no open stock positions.")
+        return "no open positions"
+    mode = getattr(settings, "stock_exit_mode", "rotate")
+
+    if mode == "rotate":
+        universe = _load_feature_universe()
+        ranked = _score_and_persist(universe) if universe else None
+        to_sell = stock_weekly.select_rotation_exits(
+            _position_dicts(positions),
+            ranked,
+            keep_rank=int(getattr(settings, "rotation_keep_rank", 20)),
+        )
+        held = len(positions) - len(to_sell)
+        if not to_sell:
+            logger.info("friday_stock_sells (rotate): holding all {} position(s)", len(positions))
+            return f"mode=rotate held={held} sold=0"
+        universe = _synthesize_missing_marks(universe or {}, positions)
+        executor = StockExecutor.from_settings()
+        result = stock_weekly.run_stock_weekly_sells(
+            open_positions=to_sell, universe=universe, executor=executor,
+        )
+        filled = sum(1 for r in getattr(result, "executed", []) if r.get("status") == "filled")
+        logger.info("friday_stock_sells (rotate): held {} / sold {} ({} filled)",
+                    held, len(to_sell), filled)
+        return f"mode=rotate held={held} sold={len(to_sell)} filled={filled}"
+
+    symbols = [getattr(p, "symbol", "") for p in positions if getattr(p, "symbol", "")]
+    universe = _synthesize_missing_marks(_load_stock_frames(symbols, lookback_days=90), positions)
     executor = StockExecutor.from_settings()
     result = stock_weekly.run_stock_weekly_sells(
         open_positions=_position_dicts(positions),
@@ -441,6 +506,7 @@ def crypto_cycle() -> None:
         available_cash=state.cash,
         btc_only=_btc_only(),
         risk_manager=rm,
+        entry_mode=getattr(settings, "crypto_entry_mode", "regime"),
     )
     executor = crypto_executor_from_settings()
     executor.paper_cash = state.cash

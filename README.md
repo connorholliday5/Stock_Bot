@@ -3,13 +3,19 @@
 An automated trading bot for a single Alpaca account, with a built-in web
 dashboard. It runs two strategies side by side from the same pot of money:
 
-- **Stocks (weekly swing):** scans and ranks a large-cap universe Sunday
-  night, buys the top-ranked names Monday 9:45 AM ET, monitors stop-losses
-  mid-week, and sells everything Friday 3:45 PM ET. The weekly cadence keeps
-  API usage tiny — far below Alpaca's rate limits.
-- **Crypto (24/7):** a 4-hour trend-following cycle on BTC (BTC-only until it
-  proves 60 profitable days), trading around the clock through Alpaca's
-  crypto market with the same account balance.
+- **Stocks (weekly rotation):** scans and ranks the S&P 500 Sunday night,
+  buys the top-ranked names Monday 9:45 AM ET, and monitors stop-losses
+  mid-week. Friday 3:45 PM ET it re-scores the market and sells only the
+  positions that fell out of the rankings — winners keep riding so momentum
+  can compound (`STOCK_EXIT_MODE=liquidate` restores the sell-everything
+  Friday). The weekly cadence keeps API usage tiny.
+- **Crypto (24/7):** a 4-hour trend-regime strategy — long while the trend
+  is intact (price above EMA200, EMAs stacked, ADX trending), flat when it
+  breaks, with stops re-checked every 15 minutes. Scans BTC/ETH/SOL/LTC/
+  DOGE/LINK/AVAX; entries stay BTC-only until it proves itself
+  (`CRYPTO_BTC_ONLY=false` unlocks the rest). A reserved slice of equity
+  (`CRYPTO_ALLOCATION_PCT`, default 25%) guarantees crypto always has cash
+  to trade even while stocks are deployed.
 
 The money already in your Alpaca account **is** the bot's capital: equity and
 cash are read live from the broker (cached 60 s) and every position is sized

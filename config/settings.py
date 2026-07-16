@@ -90,8 +90,13 @@ class Settings(BaseSettings):
     # Alpaca account; "binance" keeps the ccxt path (needs Binance keys).
     crypto_exchange: str = Field("alpaca", validation_alias="CRYPTO_EXCHANGE")
     # USDT-quoted (Binance style); the Alpaca path maps these to /USD pairs.
-    # All four trade on both venues (BNB deliberately absent - not on Alpaca).
-    crypto_universe: list = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "LTC/USDT"]
+    # All trade on both venues (BNB deliberately absent - not on Alpaca).
+    # NOTE: entries stay BTC-only while CRYPTO_BTC_ONLY=true; the rest are
+    # scanned every cycle and become tradable the moment you flip the flag.
+    crypto_universe: list = [
+        "BTC/USDT", "ETH/USDT", "SOL/USDT", "LTC/USDT",
+        "DOGE/USDT", "LINK/USDT", "AVAX/USDT",
+    ]
     # Locked strategy: entries stay BTC-only until 60 profitable days, then
     # flip this to false to trade the whole scanned universe.
     crypto_btc_only: bool = Field(True, validation_alias="CRYPTO_BTC_ONLY")
@@ -100,6 +105,22 @@ class Settings(BaseSettings):
     # Optional comma-separated ticker override (e.g. "AAPL,MSFT,NVDA").
     # Blank = full built-in S&P 500 list (data/sp500.py) on the Alpaca path.
     stock_universe: str = Field("", validation_alias="STOCK_UNIVERSE")
+
+    # --- Strategy modes ---
+    # rotate    - Friday sells only positions that fell out of the fresh
+    #             top rankings; winners keep riding (holds over weekends).
+    # liquidate - legacy: sell everything Friday 3:45, flat all weekend.
+    stock_exit_mode: str = Field("rotate", validation_alias="STOCK_EXIT_MODE")
+    # A held position survives Friday rotation while it ranks inside this
+    # many names of the fresh scoring (top_n buys, keep_rank holds).
+    rotation_keep_rank: int = Field(20, validation_alias="ROTATION_KEEP_RANK")
+    # regime - long while trend is intact (EMA9>EMA21, price>EMA200, ADX
+    #          trending); enters mid-trend. cross - legacy: only enters on a
+    #          fresh EMA9/21 cross within 3 bars (misses running trends).
+    crypto_entry_mode: str = Field("regime", validation_alias="CRYPTO_ENTRY_MODE")
+    # Fraction of equity reserved for the crypto book so Monday stock buys
+    # can never starve BTC of cash. 0 disables the reservation (shared pot).
+    crypto_allocation_pct: float = Field(0.25, validation_alias="CRYPTO_ALLOCATION_PCT")
 
     # --- Stock Strategy Params ---
     stock_stop_loss: float = 0.05
