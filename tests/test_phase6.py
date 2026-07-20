@@ -477,7 +477,7 @@ def test_low_auc_model_is_quarantined(monkeypatch, tmp_path):
     booster = model_base.with_suffix(".json")
     booster.write_text("{}")
     monkeypatch.setattr(S, "MODEL_PATH", str(model_base))
-    monkeypatch.setattr(S, "_load_feature_universe", lambda: {"AAPL": pd.DataFrame({"close": [1.0]})})
+    monkeypatch.setattr(S, "_load_feature_universe", lambda *a, **k: {"AAPL": pd.DataFrame({"close": [1.0]})})
     monkeypatch.setattr(retrain_mod, "run_rolling_retrain",
                         lambda *a, **k: types.SimpleNamespace(
                             ok=True, n_train=100, n_test=25,
@@ -498,7 +498,7 @@ def test_good_auc_model_is_kept(monkeypatch, tmp_path):
     booster = model_base.with_suffix(".json")
     booster.write_text("{}")
     monkeypatch.setattr(S, "MODEL_PATH", str(model_base))
-    monkeypatch.setattr(S, "_load_feature_universe", lambda: {"AAPL": pd.DataFrame({"close": [1.0]})})
+    monkeypatch.setattr(S, "_load_feature_universe", lambda *a, **k: {"AAPL": pd.DataFrame({"close": [1.0]})})
     monkeypatch.setattr(retrain_mod, "run_rolling_retrain",
                         lambda *a, **k: types.SimpleNamespace(
                             ok=True, n_train=100, n_test=25,

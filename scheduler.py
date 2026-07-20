@@ -200,10 +200,14 @@ def _load_crypto_funding() -> dict:
         return {}
 
 
-def _load_feature_universe() -> dict:
+def _load_feature_universe(lookback_days: int | None = None) -> dict:
     """Stock scan universe {ticker: daily feature DataFrame}.
     Polygon (full S&P 500) when a key is configured; otherwise Alpaca IEX
-    daily bars over the liquid large-cap seed list. {} on failure."""
+    daily bars over the S&P 500 list. {} on failure.
+
+    lookback_days overrides the fetch window - the Sunday retrain passes a
+    multi-year value (ML_LOOKBACK_DAYS) for more training history; the weekly
+    scan uses the fetcher's shorter default."""
     if settings.polygon_api_key and not settings.polygon_api_key.startswith("your_"):
         try:
             universe = db.get_feature_universe()
@@ -214,6 +218,8 @@ def _load_feature_universe() -> dict:
             logger.exception("_load_feature_universe (polygon) failed: {}", exc)
     try:
         from data.alpaca_data import fetch_stock_universe_alpaca
+        if lookback_days is not None:
+            return fetch_stock_universe_alpaca(lookback_days=lookback_days)
         return fetch_stock_universe_alpaca()
     except Exception as exc:
         logger.exception("_load_feature_universe (alpaca) failed: {}", exc)
@@ -358,7 +364,9 @@ def sunday_ml_retrain() -> None:
     except Exception as exc:
         logger.warning("sunday_ml_retrain: ml stack unavailable ({}); skipping.", exc)
         return "skipped: ml unavailable"
-    universe = _load_feature_universe()
+    # Multi-year history for the retrain (more training examples); the weekly
+    # scan uses the shorter default window.
+    universe = _load_feature_universe(lookback_days=int(getattr(settings, "ml_lookback_days", 1095)))
     if not universe:
         logger.warning("sunday_ml_retrain: empty feature universe. Skipping retrain.")
         return
