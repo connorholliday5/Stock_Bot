@@ -433,3 +433,76 @@ def test_stubs_run_clean(monkeypatch):
     monkeypatch.setattr(S, "_load_feature_universe", lambda: {})
     S.sunday_ml_retrain()
     S.weekly_performance_report()
+
+
+# --------------------------- reentrancy guard ---------------------------
+
+def test_double_trigger_does_not_overlap(monkeypatch):
+    """Two simultaneous invocations of the same job (double-clicked Run now)
+    must not overlap: the second records 'skipped: already running'."""
+    import threading
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_rm():
+        entered.set()
+        release.wait(timeout=5)
+        return FakeRM()
+
+    monkeypatch.setattr(S, "build_risk_manager", slow_rm)
+    monkeypatch.setattr(S, "get_account_snapshot",
+                        lambda rm=None, force=False: _static_snap(1000.0))
+    monkeypatch.setattr(S.db, "get_open_positions", lambda a: [], raising=False)
+
+    t = threading.Thread(target=S.daily_heartbeat, daemon=True)
+    t.start()
+    assert entered.wait(timeout=5)
+    S.daily_heartbeat()                       # overlapping second call
+    last = S.bot_state.last_runs()["daily_heartbeat"]
+    assert last["detail"] == "skipped: already running"
+    release.set()
+    t.join(timeout=5)
+
+
+# --------------------------- ML quality gate ---------------------------
+
+def test_low_auc_model_is_quarantined(monkeypatch, tmp_path):
+    """A model that tests at coin-flip AUC must NOT earn the 30% blend seat:
+    the artifact is moved aside so the scan stays rule-only."""
+    import types
+    import ml.retrain as retrain_mod
+    import pandas as pd
+
+    model_base = tmp_path / "weekly_stock"
+    booster = model_base.with_suffix(".json")
+    booster.write_text("{}")
+    monkeypatch.setattr(S, "MODEL_PATH", str(model_base))
+    monkeypatch.setattr(S, "_load_feature_universe", lambda *a, **k: {"AAPL": pd.DataFrame({"close": [1.0]})})
+    monkeypatch.setattr(retrain_mod, "run_rolling_retrain",
+                        lambda *a, **k: types.SimpleNamespace(
+                            ok=True, n_train=100, n_test=25,
+                            metrics={"auc": 0.487}, reason="ok"))
+    result = S.sunday_ml_retrain()
+    assert "rejected" in result
+    assert not booster.exists()                              # moved aside
+    assert booster.with_suffix(".json.rejected").exists()
+    assert S._load_ml_scorer() is None                       # rule-only now
+
+
+def test_good_auc_model_is_kept(monkeypatch, tmp_path):
+    import types
+    import ml.retrain as retrain_mod
+    import pandas as pd
+
+    model_base = tmp_path / "weekly_stock"
+    booster = model_base.with_suffix(".json")
+    booster.write_text("{}")
+    monkeypatch.setattr(S, "MODEL_PATH", str(model_base))
+    monkeypatch.setattr(S, "_load_feature_universe", lambda *a, **k: {"AAPL": pd.DataFrame({"close": [1.0]})})
+    monkeypatch.setattr(retrain_mod, "run_rolling_retrain",
+                        lambda *a, **k: types.SimpleNamespace(
+                            ok=True, n_train=100, n_test=25,
+                            metrics={"auc": 0.58}, reason="ok"))
+    result = S.sunday_ml_retrain()
+    assert "retrained" in result
+    assert booster.exists()                                  # kept

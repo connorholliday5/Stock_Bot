@@ -50,14 +50,20 @@ def run_rolling_retrain(
     model_path: Optional[str] = None,
     params: Optional[dict] = None,
     performance_writer: Optional[Callable[[dict], None]] = None,
+    label_mode: str = "relative",
 ) -> RetrainResult:
     """
     Build the pooled matrix, time order it, train on the early slice and
     evaluate out of sample on the tail. An embargo gap (default = horizon)
     is dropped between train and test so forward looking labels in the train
-    set do not leak into the holdout window.
+    set do not leak into the holdout window (a purged walk-forward split).
+
+    label_mode "relative" (default) trains against cross-sectional
+    outperformance - the right target for a rotation strategy; "absolute"
+    keeps the legacy own-return label.
     """
-    matrix, skipped = build_training_matrix(df_universe, horizon, fee_bps)
+    matrix, skipped = build_training_matrix(df_universe, horizon, fee_bps,
+                                            label_mode=label_mode)
 
     if matrix.empty:
         logger.warning("retrain aborted: empty training matrix")
@@ -87,6 +93,7 @@ def run_rolling_retrain(
     metrics["n_train"] = int(len(train))
     metrics["horizon"] = int(horizon)
     metrics["fee_bps"] = float(fee_bps)
+    metrics["label_mode"] = label_mode
 
     if model_path:
         model.save(model_path)

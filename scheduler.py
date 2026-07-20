@@ -27,6 +27,7 @@ Locked-strategy notes honored here:
 from __future__ import annotations
 
 import functools
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,6 +60,11 @@ def _btc_only() -> bool:
 # Trained weekly stock model artifact (booster at MODEL_PATH + ".json",
 # metadata at MODEL_PATH + ".meta.json"). TrainedModel.save creates the dir.
 MODEL_PATH = "models/weekly_stock"
+
+# A retrained model must beat this out-of-sample AUC to earn its blend seat;
+# below it the artifact is quarantined and the scan stays rule-only. 0.5 is
+# a coin flip - blending a sub-0.52 model just adds noise to the rankings.
+ML_MIN_AUC = 0.52
 
 
 @dataclass
@@ -194,10 +200,14 @@ def _load_crypto_funding() -> dict:
         return {}
 
 
-def _load_feature_universe() -> dict:
+def _load_feature_universe(lookback_days: int | None = None) -> dict:
     """Stock scan universe {ticker: daily feature DataFrame}.
     Polygon (full S&P 500) when a key is configured; otherwise Alpaca IEX
-    daily bars over the liquid large-cap seed list. {} on failure."""
+    daily bars over the S&P 500 list. {} on failure.
+
+    lookback_days overrides the fetch window - the Sunday retrain passes a
+    multi-year value (ML_LOOKBACK_DAYS) for more training history; the weekly
+    scan uses the fetcher's shorter default."""
     if settings.polygon_api_key and not settings.polygon_api_key.startswith("your_"):
         try:
             universe = db.get_feature_universe()
@@ -208,6 +218,8 @@ def _load_feature_universe() -> dict:
             logger.exception("_load_feature_universe (polygon) failed: {}", exc)
     try:
         from data.alpaca_data import fetch_stock_universe_alpaca
+        if lookback_days is not None:
+            return fetch_stock_universe_alpaca(lookback_days=lookback_days)
         return fetch_stock_universe_alpaca()
     except Exception as exc:
         logger.exception("_load_feature_universe (alpaca) failed: {}", exc)
@@ -276,7 +288,16 @@ def _write_model_performance(metrics: dict) -> None:
 ENTRY_JOBS = {"monday_stock_buys", "crypto_cycle"}
 
 
+# One lock per job: a job can never overlap itself. Observed live: a
+# double-clicked "Run now" launched two concurrent buy runs that raced each
+# other into duplicate orders at the broker (contained by the backstops, but
+# noisy). Second invocation now records "skipped: already running".
+_job_locks: dict[str, threading.Lock] = {}
+
+
 def _guarded(job_id: str):
+    lock = _job_locks.setdefault(job_id, threading.Lock())
+
     def decorate(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -284,6 +305,11 @@ def _guarded(job_id: str):
                 logger.warning("{}: skipped - bot paused from web UI", job_id)
                 run = bot_state.job_started(job_id)
                 bot_state.job_finished(run, ok=True, detail="skipped: paused")
+                return None
+            if not lock.acquire(blocking=False):
+                logger.warning("{}: skipped - previous run still in progress", job_id)
+                run = bot_state.job_started(job_id)
+                bot_state.job_finished(run, ok=True, detail="skipped: already running")
                 return None
             run = bot_state.job_started(job_id)
             try:
@@ -294,6 +320,8 @@ def _guarded(job_id: str):
                 logger.exception("{} failed: {}", job_id, exc)
                 bot_state.job_finished(run, ok=False, detail=str(exc))
                 return None
+            finally:
+                lock.release()
         wrapper.__wrapped_job_id__ = job_id
         return wrapper
     return decorate
@@ -336,19 +364,39 @@ def sunday_ml_retrain() -> None:
     except Exception as exc:
         logger.warning("sunday_ml_retrain: ml stack unavailable ({}); skipping.", exc)
         return "skipped: ml unavailable"
-    universe = _load_feature_universe()
+    # Multi-year history for the retrain (more training examples); the weekly
+    # scan uses the shorter default window.
+    universe = _load_feature_universe(lookback_days=int(getattr(settings, "ml_lookback_days", 1095)))
     if not universe:
         logger.warning("sunday_ml_retrain: empty feature universe. Skipping retrain.")
         return
     result = run_rolling_retrain(
         universe, model_path=MODEL_PATH, performance_writer=_write_model_performance,
     )
-    if result.ok:
-        logger.info("sunday_ml_retrain: ok train={} test={} auc={} -> {}",
-                    result.n_train, result.n_test, result.metrics.get("auc"), MODEL_PATH)
-        return f"retrained auc={result.metrics.get('auc')}"
-    logger.warning("sunday_ml_retrain: skipped ({})", result.reason)
-    return f"skipped: {result.reason}"
+    if not result.ok:
+        logger.warning("sunday_ml_retrain: skipped ({})", result.reason)
+        return f"skipped: {result.reason}"
+    auc = result.metrics.get("auc")
+    if auc is not None and float(auc) < ML_MIN_AUC:
+        _quarantine_model(float(auc))
+        return f"rejected auc={float(auc):.3f} < {ML_MIN_AUC} (rule-only scoring)"
+    logger.info("sunday_ml_retrain: ok train={} test={} auc={} -> {}",
+                result.n_train, result.n_test, auc, MODEL_PATH)
+    return f"retrained auc={auc}"
+
+
+def _quarantine_model(auc: float) -> None:
+    """Move a below-threshold model artifact aside so _load_ml_scorer cannot
+    pick it up. The scan then runs rule-only until a retrain clears the bar."""
+    logger.warning("sunday_ml_retrain: model REJECTED (auc={:.3f} < {}); "
+                   "quarantining artifact - scan stays rule-only.", auc, ML_MIN_AUC)
+    for suffix in (".json", ".meta.json"):
+        path = Path(str(MODEL_PATH) + suffix)
+        try:
+            if path.exists():
+                path.replace(path.with_suffix(path.suffix + ".rejected"))
+        except Exception as exc:
+            logger.warning("_quarantine_model: could not move {} ({})", path, exc)
 
 
 @_guarded("monday_stock_buys")

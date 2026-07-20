@@ -118,6 +118,10 @@ class Settings(BaseSettings):
     #          trending); enters mid-trend. cross - legacy: only enters on a
     #          fresh EMA9/21 cross within 3 bars (misses running trends).
     crypto_entry_mode: str = Field("regime", validation_alias="CRYPTO_ENTRY_MODE")
+    # Calendar-day lookback the Sunday ML retrain pulls (the weekly scan uses
+    # a shorter window). More history = more training examples; ~3 years is a
+    # good default for daily-bar cross-sectional models.
+    ml_lookback_days: int = Field(1095, validation_alias="ML_LOOKBACK_DAYS")
     # Fraction of equity reserved for the crypto book so Monday stock buys
     # can never starve BTC of cash. 0 disables the reservation (shared pot).
     crypto_allocation_pct: float = Field(0.25, validation_alias="CRYPTO_ALLOCATION_PCT")
