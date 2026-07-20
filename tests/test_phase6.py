@@ -433,3 +433,47 @@ def test_stubs_run_clean(monkeypatch):
     monkeypatch.setattr(S, "_load_feature_universe", lambda: {})
     S.sunday_ml_retrain()
     S.weekly_performance_report()
+
+
+# --------------------------- ML quality gate ---------------------------
+
+def test_low_auc_model_is_quarantined(monkeypatch, tmp_path):
+    """A model that tests at coin-flip AUC must NOT earn the 30% blend seat:
+    the artifact is moved aside so the scan stays rule-only."""
+    import types
+    import ml.retrain as retrain_mod
+    import pandas as pd
+
+    model_base = tmp_path / "weekly_stock"
+    booster = model_base.with_suffix(".json")
+    booster.write_text("{}")
+    monkeypatch.setattr(S, "MODEL_PATH", str(model_base))
+    monkeypatch.setattr(S, "_load_feature_universe", lambda: {"AAPL": pd.DataFrame({"close": [1.0]})})
+    monkeypatch.setattr(retrain_mod, "run_rolling_retrain",
+                        lambda *a, **k: types.SimpleNamespace(
+                            ok=True, n_train=100, n_test=25,
+                            metrics={"auc": 0.487}, reason="ok"))
+    result = S.sunday_ml_retrain()
+    assert "rejected" in result
+    assert not booster.exists()                              # moved aside
+    assert booster.with_suffix(".json.rejected").exists()
+    assert S._load_ml_scorer() is None                       # rule-only now
+
+
+def test_good_auc_model_is_kept(monkeypatch, tmp_path):
+    import types
+    import ml.retrain as retrain_mod
+    import pandas as pd
+
+    model_base = tmp_path / "weekly_stock"
+    booster = model_base.with_suffix(".json")
+    booster.write_text("{}")
+    monkeypatch.setattr(S, "MODEL_PATH", str(model_base))
+    monkeypatch.setattr(S, "_load_feature_universe", lambda: {"AAPL": pd.DataFrame({"close": [1.0]})})
+    monkeypatch.setattr(retrain_mod, "run_rolling_retrain",
+                        lambda *a, **k: types.SimpleNamespace(
+                            ok=True, n_train=100, n_test=25,
+                            metrics={"auc": 0.58}, reason="ok"))
+    result = S.sunday_ml_retrain()
+    assert "retrained" in result
+    assert booster.exists()                                  # kept

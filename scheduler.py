@@ -60,6 +60,11 @@ def _btc_only() -> bool:
 # metadata at MODEL_PATH + ".meta.json"). TrainedModel.save creates the dir.
 MODEL_PATH = "models/weekly_stock"
 
+# A retrained model must beat this out-of-sample AUC to earn its blend seat;
+# below it the artifact is quarantined and the scan stays rule-only. 0.5 is
+# a coin flip - blending a sub-0.52 model just adds noise to the rankings.
+ML_MIN_AUC = 0.52
+
 
 @dataclass
 class AccountState:
@@ -343,12 +348,30 @@ def sunday_ml_retrain() -> None:
     result = run_rolling_retrain(
         universe, model_path=MODEL_PATH, performance_writer=_write_model_performance,
     )
-    if result.ok:
-        logger.info("sunday_ml_retrain: ok train={} test={} auc={} -> {}",
-                    result.n_train, result.n_test, result.metrics.get("auc"), MODEL_PATH)
-        return f"retrained auc={result.metrics.get('auc')}"
-    logger.warning("sunday_ml_retrain: skipped ({})", result.reason)
-    return f"skipped: {result.reason}"
+    if not result.ok:
+        logger.warning("sunday_ml_retrain: skipped ({})", result.reason)
+        return f"skipped: {result.reason}"
+    auc = result.metrics.get("auc")
+    if auc is not None and float(auc) < ML_MIN_AUC:
+        _quarantine_model(float(auc))
+        return f"rejected auc={float(auc):.3f} < {ML_MIN_AUC} (rule-only scoring)"
+    logger.info("sunday_ml_retrain: ok train={} test={} auc={} -> {}",
+                result.n_train, result.n_test, auc, MODEL_PATH)
+    return f"retrained auc={auc}"
+
+
+def _quarantine_model(auc: float) -> None:
+    """Move a below-threshold model artifact aside so _load_ml_scorer cannot
+    pick it up. The scan then runs rule-only until a retrain clears the bar."""
+    logger.warning("sunday_ml_retrain: model REJECTED (auc={:.3f} < {}); "
+                   "quarantining artifact - scan stays rule-only.", auc, ML_MIN_AUC)
+    for suffix in (".json", ".meta.json"):
+        path = Path(str(MODEL_PATH) + suffix)
+        try:
+            if path.exists():
+                path.replace(path.with_suffix(path.suffix + ".rejected"))
+        except Exception as exc:
+            logger.warning("_quarantine_model: could not move {} ({})", path, exc)
 
 
 @_guarded("monday_stock_buys")
