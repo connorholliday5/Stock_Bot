@@ -435,6 +435,35 @@ def test_stubs_run_clean(monkeypatch):
     S.weekly_performance_report()
 
 
+# --------------------------- reentrancy guard ---------------------------
+
+def test_double_trigger_does_not_overlap(monkeypatch):
+    """Two simultaneous invocations of the same job (double-clicked Run now)
+    must not overlap: the second records 'skipped: already running'."""
+    import threading
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_rm():
+        entered.set()
+        release.wait(timeout=5)
+        return FakeRM()
+
+    monkeypatch.setattr(S, "build_risk_manager", slow_rm)
+    monkeypatch.setattr(S, "get_account_snapshot",
+                        lambda rm=None, force=False: _static_snap(1000.0))
+    monkeypatch.setattr(S.db, "get_open_positions", lambda a: [], raising=False)
+
+    t = threading.Thread(target=S.daily_heartbeat, daemon=True)
+    t.start()
+    assert entered.wait(timeout=5)
+    S.daily_heartbeat()                       # overlapping second call
+    last = S.bot_state.last_runs()["daily_heartbeat"]
+    assert last["detail"] == "skipped: already running"
+    release.set()
+    t.join(timeout=5)
+
+
 # --------------------------- ML quality gate ---------------------------
 
 def test_low_auc_model_is_quarantined(monkeypatch, tmp_path):

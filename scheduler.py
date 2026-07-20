@@ -27,6 +27,7 @@ Locked-strategy notes honored here:
 from __future__ import annotations
 
 import functools
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -281,7 +282,16 @@ def _write_model_performance(metrics: dict) -> None:
 ENTRY_JOBS = {"monday_stock_buys", "crypto_cycle"}
 
 
+# One lock per job: a job can never overlap itself. Observed live: a
+# double-clicked "Run now" launched two concurrent buy runs that raced each
+# other into duplicate orders at the broker (contained by the backstops, but
+# noisy). Second invocation now records "skipped: already running".
+_job_locks: dict[str, threading.Lock] = {}
+
+
 def _guarded(job_id: str):
+    lock = _job_locks.setdefault(job_id, threading.Lock())
+
     def decorate(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -289,6 +299,11 @@ def _guarded(job_id: str):
                 logger.warning("{}: skipped - bot paused from web UI", job_id)
                 run = bot_state.job_started(job_id)
                 bot_state.job_finished(run, ok=True, detail="skipped: paused")
+                return None
+            if not lock.acquire(blocking=False):
+                logger.warning("{}: skipped - previous run still in progress", job_id)
+                run = bot_state.job_started(job_id)
+                bot_state.job_finished(run, ok=True, detail="skipped: already running")
                 return None
             run = bot_state.job_started(job_id)
             try:
@@ -299,6 +314,8 @@ def _guarded(job_id: str):
                 logger.exception("{} failed: {}", job_id, exc)
                 bot_state.job_finished(run, ok=False, detail=str(exc))
                 return None
+            finally:
+                lock.release()
         wrapper.__wrapped_job_id__ = job_id
         return wrapper
     return decorate
