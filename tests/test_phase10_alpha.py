@@ -203,6 +203,42 @@ def test_gate_log_explains_every_rejection():
     assert gate_log["ETH/USD"] == "btc_only"
 
 
+# ---------------------------------------------------------------------------
+# Correlation guard: momentum rankings cluster by sector, so without this
+# "8 positions" can be 8 versions of one bet and the heat cap understates
+# the real risk.
+# ---------------------------------------------------------------------------
+
+def _corr_frame(seed, n=120, driver=None):
+    rng = np.random.default_rng(seed)
+    if driver is None:
+        driver = rng.normal(0, 0.01, n)
+    close = 100 * np.cumprod(1 + driver)
+    return pd.DataFrame({"close": close})
+
+
+def test_correlation_detects_near_duplicate():
+    from strategies.stock_weekly import correlation_with_selected
+    rng = np.random.default_rng(5)
+    shared = rng.normal(0, 0.01, 120)
+    universe = {
+        "AAA": _corr_frame(1, driver=shared),
+        "BBB": _corr_frame(2, driver=shared * 0.99 + rng.normal(0, 0.0005, 120)),
+        "ZZZ": _corr_frame(3),
+    }
+    corr_twin, twin = correlation_with_selected("BBB", ["AAA"], universe)
+    assert twin == "AAA" and abs(corr_twin) > 0.9        # near-duplicate
+    corr_indep, _ = correlation_with_selected("ZZZ", ["AAA"], universe)
+    assert abs(corr_indep) < 0.5                          # independent name
+
+
+def test_correlation_unknown_never_blocks():
+    """Missing/short data must not gate a trade - unknown != correlated."""
+    from strategies.stock_weekly import correlation_with_selected
+    corr, twin = correlation_with_selected("AAA", ["BBB"], {"AAA": None, "BBB": None})
+    assert corr == 0.0 and twin is None
+
+
 def test_gate_summary_counts_reasons():
     from strategies.crypto_24h import CryptoCycleResult
     res = CryptoCycleResult(gate_reasons={

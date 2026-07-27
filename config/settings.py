@@ -77,6 +77,11 @@ class Settings(BaseSettings):
     weekly_drawdown_halt_stock: float = Field(-0.08, validation_alias="WEEKLY_DRAWDOWN_HALT_STOCK")
     weekly_drawdown_halt_crypto: float = Field(-0.10, validation_alias="WEEKLY_DRAWDOWN_HALT_CRYPTO")
     min_position_size: float = Field(50.0, validation_alias="MIN_POSITION_SIZE")
+    # Reject a stock entry whose trailing returns track an already-held name
+    # more closely than this. Momentum rankings cluster by sector, so without
+    # it "8 positions" can be 8 versions of one bet. 1.0 disables the guard.
+    max_position_correlation: float = Field(
+        0.85, validation_alias="MAX_POSITION_CORRELATION")
 
     # --- Market Timing (EST) ---
     stock_buy_time: str = "09:45"
