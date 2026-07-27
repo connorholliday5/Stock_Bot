@@ -100,6 +100,32 @@ Everything lives in `.env` (see `.env.example` for the full list):
   monitoring and scheduled exits keep running so open positions stay
   protected.
 
+## Backtesting
+
+Replay the live strategy over real history before trusting a change:
+
+```bash
+python -m backtest.run --years 3
+python -m backtest.run --years 5 --top-n 5 --cost-bps 15 --csv equity.csv
+```
+
+The engine calls the **same** scorer, rotation rule and position sizer the
+scheduler calls, so it tests the strategy you actually run. Decisions on bar
+T use data through T only and execute at T+1's open; entry/exit costs, the
+stop (with gap-down fills) and the no-margin cash constraint are modeled.
+
+Two honest caveats: the ticker list is *today's* index membership, so
+delisted names are missing (survivorship bias — absolute returns are
+optimistic), and only OHLC is known intrabar, so a bar touching both stop
+and target resolves stop-first.
+
+## Keeping it running (Windows)
+
+`start_bot.bat` launches the bot with its venv. To survive reboots, register
+it in Task Scheduler with a "When the computer starts" trigger — the file's
+header comments have the exact steps. Also set Power → Sleep → Never; a
+sleeping PC stops watching your stops.
+
 ## Development
 
 ```bash
