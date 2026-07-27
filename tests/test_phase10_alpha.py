@@ -152,3 +152,62 @@ def test_crypto_universe_includes_doge():
 def test_doge_maps_to_alpaca_pair():
     from execution.alpaca_crypto import to_alpaca_symbol
     assert to_alpaca_symbol("DOGE/USDT") == "DOGE/USD"
+
+
+# ---------------------------------------------------------------------------
+# btc_only gate must be venue-agnostic (regression: the Alpaca-routed bot
+# compared "BTC/USD" against a hardcoded "BTC/USDT", so EVERY symbol was
+# rejected and no crypto entry could ever be generated - for two weeks the
+# logs truthfully reported "opened=0" while the path was structurally dead)
+# ---------------------------------------------------------------------------
+
+def test_is_btc_accepts_both_venue_quotes():
+    from strategies.crypto_24h import is_btc
+    assert is_btc("BTC/USD")      # Alpaca
+    assert is_btc("BTC/USDT")     # Binance
+    assert is_btc("btc/usd")      # case-insensitive
+    assert not is_btc("ETH/USD")
+    assert not is_btc("DOGE/USDT")
+
+
+def test_btc_only_gate_admits_alpaca_btc():
+    """The exact live configuration: Alpaca-style universe + btc_only=True."""
+    df = make_established_uptrend_4h()
+    plans = generate_24h_entries(
+        universe={"BTC/USD": df, "ETH/USD": df},
+        funding_rates={},
+        open_positions=[],
+        equity=10_000.0,
+        available_cash=10_000.0,
+        btc_only=True,
+        entry_mode="regime",
+    )
+    assert [p.symbol for p in plans] == ["BTC/USD"]   # BTC admitted, ETH gated
+
+
+def test_gate_log_explains_every_rejection():
+    """A zero-entry cycle must be explainable, not mysterious."""
+    df = make_established_uptrend_4h()
+    gate_log = {}
+    generate_24h_entries(
+        universe={"BTC/USD": df, "ETH/USD": df},
+        funding_rates={},
+        open_positions=[],
+        equity=10_000.0,
+        available_cash=10_000.0,
+        btc_only=True,
+        entry_mode="regime",
+        gate_log=gate_log,
+    )
+    assert gate_log["BTC/USD"] == "ok"
+    assert gate_log["ETH/USD"] == "btc_only"
+
+
+def test_gate_summary_counts_reasons():
+    from strategies.crypto_24h import CryptoCycleResult
+    res = CryptoCycleResult(gate_reasons={
+        "ETH/USD": "btc_only", "SOL/USD": "btc_only", "BTC/USD": "below_ema200",
+    })
+    summary = res.gate_summary()
+    assert "btc_only=2" in summary
+    assert "below_ema200=1" in summary

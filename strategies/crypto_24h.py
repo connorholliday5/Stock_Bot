@@ -81,6 +81,22 @@ MIN_BARS_24H = 210              # need a valid EMA200 (200) plus headroom
 MIN_POSITION_USD = 50.0
 
 BTC_SYMBOL = "BTC/USDT"
+BTC_BASE = "BTC"
+
+
+def _base_asset(symbol: str) -> str:
+    """'BTC/USDT' -> 'BTC', 'BTC/USD' -> 'BTC', 'BTCUSD' -> 'BTCUSD'.
+
+    The btc_only gate must work whichever venue supplies the universe:
+    Binance quotes in USDT, Alpaca in USD. Comparing whole symbols against a
+    hardcoded 'BTC/USDT' silently rejected EVERY Alpaca symbol (including
+    BTC/USD), so no crypto entry could ever be generated.
+    """
+    return (symbol or "").split("/", 1)[0].upper()
+
+
+def is_btc(symbol: str) -> bool:
+    return _base_asset(symbol) == BTC_BASE
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +148,21 @@ class CryptoCycleResult:
     entries: list[CryptoEntryPlan] = field(default_factory=list)
     exits: list[CryptoExitPlan] = field(default_factory=list)
     persisted: int = 0
+    # symbol -> the gate that blocked it this cycle ("ok" when it passed).
+    # Without this, a cycle that opens nothing is indistinguishable from a
+    # cycle that COULD NOT open anything - which is exactly how a symbol-
+    # matching bug hid for two weeks behind a truthful-looking "opened=0".
+    gate_reasons: dict = field(default_factory=dict)
+
+    def gate_summary(self) -> str:
+        """Compact 'why nothing traded' line, most common reason first."""
+        if not self.gate_reasons:
+            return ""
+        counts: dict[str, int] = {}
+        for reason in self.gate_reasons.values():
+            counts[reason] = counts.get(reason, 0) + 1
+        parts = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        return " ".join(f"{reason}={n}" for reason, n in parts)
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +456,13 @@ def generate_24h_entries(
     win_loss_ratio: float = DEFAULT_WIN_LOSS_RATIO,
     risk_manager: Optional[RiskManager] = None,
     entry_mode: str = "cross",
+    gate_log: Optional[dict] = None,
 ) -> list[CryptoEntryPlan]:
     """Evaluate every symbol and return sizeable, gated long entry plans.
+
+    Pass a dict as `gate_log` to record, per symbol, which gate rejected it
+    ("ok" when an entry plan was produced) - the observability that makes a
+    zero-entry cycle explainable instead of mysterious.
 
     entry_mode:
       "cross"  - legacy: requires a FRESH EMA9/21 cross within 3 bars plus a
@@ -449,38 +485,51 @@ def generate_24h_entries(
     if risk_manager is not None:
         current_heat = risk_manager.portfolio_heat(AssetType.CRYPTO, equity=equity)
 
+    def _blocked(symbol: str, reason: str) -> None:
+        if gate_log is not None:
+            gate_log[symbol] = reason
+        logger.debug("%s: entry blocked by %s", symbol, reason)
+
     for symbol, df in universe.items():
         if open_count + len(plans) >= max_positions:
             logger.info("Max crypto positions reached (%d) - no more entries", max_positions)
             break
         if symbol in held:
+            _blocked(symbol, "already_held")
             continue
-        if btc_only and symbol != BTC_SYMBOL:
-            logger.debug("btc_only gate: skipping %s", symbol)
+        if btc_only and not is_btc(symbol):
+            _blocked(symbol, "btc_only")
             continue
         if df is None or len(df) < MIN_BARS_24H:
-            logger.debug("%s: insufficient bars for 24h entry", symbol)
+            _blocked(symbol, "insufficient_bars")
             continue
 
         if not above_ema200(df):
+            _blocked(symbol, "below_ema200")
             continue
         regime = classify_regime(df)
         if regime != MarketRegime.TRENDING:
-            logger.debug("%s: regime %s not tradable for trend entry", symbol, regime.value)
+            _blocked(symbol, f"regime_{regime.value}")
             continue
         if entry_mode == "regime":
             if not ema_stacked_bullish(df):
+                _blocked(symbol, "ema_not_stacked")
                 continue
             if not macd_positive(df):
+                _blocked(symbol, "macd_not_positive")
                 continue
             if _last_float(df, "volume_ratio", 0.0) < 1.0:
+                _blocked(symbol, "volume_below_avg")
                 continue
         else:
             if not bullish_ema_cross(df):
+                _blocked(symbol, "no_fresh_ema_cross")
                 continue
             if not macd_confirms_long(df):
+                _blocked(symbol, "macd_unconfirmed")
                 continue
             if _last_float(df, "volume_ratio", 0.0) < VOLUME_SPIKE_MIN:
+                _blocked(symbol, "no_volume_spike")
                 continue
 
         entry_price = _last_float(df, "close")
@@ -499,8 +548,11 @@ def generate_24h_entries(
         )
         if not sizing.tradable:
             logger.info("%s: entry gated by sizing (%s)", symbol, sizing.reason)
+            _blocked(symbol, f"sizing_{sizing.reason}")
             continue
 
+        if gate_log is not None:
+            gate_log[symbol] = "ok"
         plans.append(CryptoEntryPlan(
             symbol=symbol,
             entry_price=entry_price,
@@ -610,7 +662,9 @@ def run_crypto_24h_pipeline(
     exiting_symbols = {e.symbol for e in exits}
     remaining_positions = [p for p in open_positions if _position_symbol(p) not in exiting_symbols]
 
+    gate_log: dict = {}
     entries = generate_24h_entries(
+        gate_log=gate_log,
         universe=universe,
         funding_rates=funding_rates,
         open_positions=remaining_positions,
@@ -628,4 +682,5 @@ def run_crypto_24h_pipeline(
         events = [e.signal for e in exits] + [p.signal for p in entries]
         persisted = persist_signals(events)
 
-    return CryptoCycleResult(entries=entries, exits=exits, persisted=persisted)
+    return CryptoCycleResult(entries=entries, exits=exits, persisted=persisted,
+                             gate_reasons=gate_log)

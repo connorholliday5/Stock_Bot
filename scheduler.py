@@ -579,7 +579,17 @@ def crypto_cycle() -> None:
     logger.info("crypto_cycle: complete -> {} entries ({} filled), {} exits ({} filled)",
                 len(getattr(result, "entries", [])), opened,
                 len(getattr(result, "exits", [])), closed)
-    return f"opened={opened} closed={closed}"
+    # Always say WHY a cycle opened nothing: a silent "opened=0" hid a
+    # symbol-matching bug that made crypto entries impossible for two weeks.
+    summary = ""
+    try:
+        summary = result.gate_summary()
+    except Exception:
+        pass
+    if summary:
+        logger.info("crypto_cycle: gates -> {}", summary)
+    detail = f"opened={opened} closed={closed}"
+    return f"{detail} [{summary}]" if summary else detail
 
 
 def _latest_crypto_prices(symbols: list[str]) -> dict:
