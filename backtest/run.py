@@ -38,9 +38,14 @@ def main() -> int:
     from data.alpaca_data import fetch_stock_universe_alpaca
     from backtest.engine import BacktestConfig as _Cfg
 
-    symbols = list(tickers) if tickers else None
-    if symbols is not None and _Cfg().benchmark not in symbols:
-        symbols.append(_Cfg().benchmark)                 # benchmark needs bars too
+    # The benchmark is an ETF, not an index constituent, so it is never in
+    # the default S&P 500 list and must be appended explicitly - otherwise
+    # the comparison silently reports nan, which is the one number that says
+    # whether any of this beats doing nothing.
+    from data.alpaca_data import default_stock_universe
+    symbols = list(tickers) if tickers else default_stock_universe()
+    if _Cfg().benchmark not in symbols:
+        symbols.append(_Cfg().benchmark)
 
     logger.info("fetching {} days of history...", lookback_days)
     universe = fetch_stock_universe_alpaca(lookback_days=lookback_days, tickers=symbols)

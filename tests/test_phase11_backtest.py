@@ -146,6 +146,16 @@ def test_open_trade_has_zero_pnl():
     assert t.pnl == 0.0 and t.bars_held is None
 
 
+def test_benchmark_is_reported_when_present():
+    """A nan benchmark hides the only number that matters - whether the
+    strategy beats doing nothing. Regression: SPY is an ETF, never an index
+    constituent, so the default universe omitted it and the comparison was
+    silently nan."""
+    res = run_backtest(_universe(8), BacktestConfig(warmup_bars=210))
+    assert not res.benchmark.empty
+    assert res.metrics["benchmark_return_pct"] == res.metrics["benchmark_return_pct"]
+
+
 def test_summary_is_printable():
     res = run_backtest(_universe(8), BacktestConfig(warmup_bars=210))
     text = res.summary()
