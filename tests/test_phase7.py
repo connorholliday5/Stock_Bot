@@ -349,6 +349,50 @@ def test_retrain_writer_failure_does_not_kill_job():
     assert res.ok  # adapter failure swallowed
 
 
+def test_walk_forward_reports_multiple_folds():
+    """Stability across folds is the real signal; one holdout is one draw."""
+    from ml.retrain import purged_walk_forward
+    matrix, _ = build_training_matrix(_make_universe(16, signal=1.5), horizon=5)
+    matrix = matrix.sort_values("date").reset_index(drop=True)
+    wf = purged_walk_forward(matrix, n_folds=4, embargo=5,
+                             params={"n_estimators": 40})
+    assert wf["n_folds"] >= 2
+    assert len(wf["fold_aucs"]) == wf["n_folds"]
+    assert 0.0 <= wf["auc_mean"] <= 1.0
+    assert wf["auc_std"] >= 0.0
+
+
+def test_walk_forward_short_history_returns_empty():
+    from ml.retrain import purged_walk_forward
+    tiny = pd.DataFrame({"label": [0, 1] * 10})
+    assert purged_walk_forward(tiny)["n_folds"] == 0
+
+
+def test_retrain_includes_walk_forward_metrics():
+    res = run_rolling_retrain(
+        _make_universe(14, signal=1.5), horizon=5,
+        params={"n_estimators": 40}, walk_forward_folds=3,
+    )
+    assert res.ok
+    assert "auc_mean" in res.metrics and "fold_aucs" in res.metrics
+
+
+def test_gpu_detection_is_safe_and_cached():
+    """Must return a bool and never raise, GPU present or not."""
+    from ml.model import gpu_available
+    first = gpu_available()
+    assert isinstance(first, bool)
+    assert gpu_available() is first          # cached
+
+
+def test_training_works_regardless_of_device():
+    matrix, _ = build_training_matrix(_make_universe(8), horizon=5)
+    model = train_model(matrix[FEATURE_COLS], matrix["label"],
+                        params={"n_estimators": 30})
+    probs = model.predict_proba(matrix[FEATURE_COLS].head(10))
+    assert ((probs >= 0.0) & (probs <= 1.0)).all()
+
+
 def test_retrain_insufficient_data():
     res = run_rolling_retrain({}, horizon=5)
     assert not res.ok

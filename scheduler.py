@@ -376,13 +376,28 @@ def sunday_ml_retrain() -> None:
     if not result.ok:
         logger.warning("sunday_ml_retrain: skipped ({})", result.reason)
         return f"skipped: {result.reason}"
-    auc = result.metrics.get("auc")
+    # Judge on the walk-forward MEAN when we have folds: a single holdout can
+    # clear the bar by luck, and a model promoted on luck quietly degrades the
+    # rankings for a week. Fall back to the holdout AUC only if folds are
+    # unavailable (short history).
+    metrics = result.metrics
+    folds = int(metrics.get("n_folds", 0) or 0)
+    auc = metrics.get("auc_mean") if folds >= 2 else metrics.get("auc")
+    basis = f"walk-forward mean of {folds} folds" if folds >= 2 else "holdout"
     if auc is not None and float(auc) < ML_MIN_AUC:
         _quarantine_model(float(auc))
-        return f"rejected auc={float(auc):.3f} < {ML_MIN_AUC} (rule-only scoring)"
-    logger.info("sunday_ml_retrain: ok train={} test={} auc={} -> {}",
-                result.n_train, result.n_test, auc, MODEL_PATH)
-    return f"retrained auc={auc}"
+        return (f"rejected auc={float(auc):.3f} < {ML_MIN_AUC} "
+                f"({basis}, rule-only scoring)")
+    logger.info("sunday_ml_retrain: ok train={} test={} auc={} ({}) -> {}",
+                result.n_train, result.n_test, auc, basis, MODEL_PATH)
+    spread = metrics.get("auc_std")
+    extra = ""
+    try:
+        if spread is not None and float(spread) == float(spread):   # not NaN
+            extra = f" std={float(spread):.3f}"
+    except (TypeError, ValueError):
+        pass
+    return f"retrained auc={float(auc):.3f} ({basis}{extra})" if auc is not None else "retrained"
 
 
 def _quarantine_model(auc: float) -> None:
