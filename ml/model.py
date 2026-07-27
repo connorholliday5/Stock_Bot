@@ -128,7 +128,15 @@ class TrainedModel:
         """P(positive) per row, indexed like X. Empty in -> empty out."""
         if X is None or X.empty:
             return pd.Series(dtype="float64", name="ml_prob")
-        Xm = X[self.feature_cols].astype("float64")
+        # A GPU-trained booster predicting on CPU arrays makes XGBoost copy
+        # through a DMatrix ("mismatched devices" warning) - slower and
+        # heavier. Inference is ~500 rows once a week, so pin the booster to
+        # CPU for prediction; training keeps the GPU where it actually pays.
+        try:
+            self.model.get_booster().set_param({"device": "cpu"})
+        except Exception:
+            pass
+        Xm = X[self.feature_cols].astype("float32")
         proba = self.model.predict_proba(Xm.to_numpy())[:, 1]
         return pd.Series(proba, index=X.index, name="ml_prob")
 

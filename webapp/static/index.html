@@ -622,8 +622,13 @@ function renderJobs() {
     const row = document.createElement("div");
     row.className = "job-row";
     const last = (s.last_runs || {})[job.id];
+    // A job with no finished_at is still RUNNING. Treating "not failed" as
+    // "succeeded" made an in-progress job render as "✓ ok" - misleading now
+    // that the ML retrain takes minutes (3y of data + walk-forward folds).
+    const running = !!last && !last.finished_at;
     const dot = document.createElement("span");
-    dot.className = "dot" + (last ? (last.ok === false ? " fail" : " ok") : "");
+    dot.className = "dot" + (running ? " busy"
+      : last ? (last.ok === false ? " fail" : " ok") : "");
     const name = document.createElement("div");
     name.className = "name";
     name.textContent = JOB_LABELS[job.id] || job.id;
