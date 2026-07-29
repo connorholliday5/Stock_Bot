@@ -83,6 +83,35 @@ def test_momentum_skip_window_is_applied():
     assert res.metrics
 
 
+def test_weighting_modes_all_run_and_stay_invested():
+    uni = _universe(20)
+    for mode in ("equal", "rank", "score"):
+        res = backtest_momentum(uni, LabConfig(weighting=mode, top_n=5))
+        assert res.metrics, f"{mode} produced nothing"
+        assert (res.equity > 0).all()
+
+
+def test_weights_sum_to_one_and_favour_the_leader():
+    from backtest.lab import _weights
+    syms = ["A", "B", "C"]
+    scores = pd.Series({"A": 0.9, "B": 0.5, "C": 0.1})
+    for mode in ("equal", "rank", "score"):
+        w = dict(_weights(syms, scores, mode))
+        assert sum(w.values()) == pytest.approx(1.0)
+    assert dict(_weights(syms, scores, "equal"))["A"] == pytest.approx(1 / 3)
+    # concentrating modes give the leader strictly more than an equal split
+    assert dict(_weights(syms, scores, "rank"))["A"] > 1 / 3
+    assert dict(_weights(syms, scores, "score"))["A"] > 1 / 3
+
+
+def test_score_weighting_survives_all_negative_scores():
+    """Never divide by zero, and never short: fall back to equal weight."""
+    from backtest.lab import _weights
+    scores = pd.Series({"A": -0.2, "B": -0.5})
+    w = dict(_weights(["A", "B"], scores, "score"))
+    assert w["A"] == pytest.approx(0.5) and w["B"] == pytest.approx(0.5)
+
+
 def test_costs_scale_with_turnover():
     uni = _universe()
     cheap = backtest_trend_filter(uni, LabConfig(cost_bps=1.0))

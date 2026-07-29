@@ -52,6 +52,11 @@ class LabConfig:
     momentum_skip: int = 21           # skip most recent ~1 month
     warmup_bars: int = 260
     benchmark: str = "SPY"
+    # How capital is split across the top N:
+    #   equal - 1/N each (academic standard)
+    #   rank  - linear decay, best name gets the largest slice
+    #   score - proportional to the momentum score itself (most aggressive)
+    weighting: str = "equal"
 
 
 def _px(df: pd.DataFrame, date, col: str = "close") -> Optional[float]:
@@ -157,6 +162,31 @@ def backtest_trend_filter(universe: dict, cfg: Optional[LabConfig] = None,
 # 3. cross-sectional momentum, 12-1, monthly rebalance
 # ---------------------------------------------------------------------------
 
+def _weights(symbols: list[str], scores: Optional[pd.Series],
+             mode: str) -> list[tuple[str, float]]:
+    """Capital split across the selected names, summing to 1.0.
+
+    'equal' is the academic standard for a reason: momentum RANK carries
+    information, but the magnitude of a momentum score is a much weaker
+    predictor of future return - and the highest-scoring name is usually the
+    most extended, so score-weighting concentrates into exactly the stock
+    most exposed to a momentum crash.
+    """
+    n = len(symbols)
+    if n == 0:
+        return []
+    if mode == "rank":
+        raw = [float(n - i) for i in range(n)]            # linear decay
+    elif mode == "score" and scores is not None:
+        raw = [max(float(scores.get(s, 0.0)), 0.0) for s in symbols]
+        if sum(raw) <= 0:
+            raw = [1.0] * n
+    else:
+        raw = [1.0] * n
+    total = sum(raw)
+    return [(s, r / total) for s, r in zip(symbols, raw)]
+
+
 def backtest_momentum(universe: dict, cfg: Optional[LabConfig] = None) -> BacktestResult:
     cfg = cfg or LabConfig()
     syms = [s for s in universe if s != cfg.benchmark]
@@ -173,6 +203,7 @@ def backtest_momentum(universe: dict, cfg: Optional[LabConfig] = None) -> Backte
     holdings: dict[str, float] = {}
     cost_rate = cfg.cost_bps / 10_000.0
     pending: Optional[list[str]] = None
+    pending_scores: Optional[pd.Series] = None
     points = []
 
     for i in range(cfg.warmup_bars, len(dates)):
@@ -190,17 +221,20 @@ def backtest_momentum(universe: dict, cfg: Optional[LabConfig] = None) -> Backte
                     trades += 1
             holdings = {}
             if pending:
-                each = cash / len(pending)
-                for s in pending:
+                budget = cash
+                for s, w in _weights(pending, pending_scores, cfg.weighting):
                     px = _px(universe[s], today, "open") or row.get(s)
                     if not px or px <= 0:
                         continue
-                    spend = each / (1 + cost_rate)
+                    spend = (budget * w) / (1 + cost_rate)
+                    if spend <= 0:
+                        continue
                     holdings[s] = spend / px
                     cash -= spend + spend * cost_rate
                     costs += spend * cost_rate
                     trades += 1
             pending = None
+            pending_scores = None
 
         equity = cash + sum(u * (row.get(s) or 0.0) for s, u in holdings.items())
         points.append((today, equity))
@@ -217,7 +251,8 @@ def backtest_momentum(universe: dict, cfg: Optional[LabConfig] = None) -> Backte
         mom = (recent / past - 1.0).replace([np.inf, -np.inf], np.nan).dropna()
         if mom.empty:
             continue
-        pending = list(mom.sort_values(ascending=False).head(cfg.top_n).index)
+        top = mom.sort_values(ascending=False).head(cfg.top_n)
+        pending, pending_scores = list(top.index), top
 
     return _finish(points, trades, costs, universe, cfg)
 

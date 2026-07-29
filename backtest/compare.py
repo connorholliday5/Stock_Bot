@@ -27,6 +27,10 @@ def main() -> int:
     ap.add_argument("--ma", type=int, default=200, help="trend-filter MA window")
     ap.add_argument("--include-rotation", action="store_true",
                     help="also run the bot's current weekly rotation (slow)")
+    ap.add_argument("--weightings", type=str, default="equal,rank,score",
+                    help="how momentum splits capital across its top N: equal "
+                         "(1/N), rank (linear decay to the best name), score "
+                         "(proportional to momentum). Comma separated.")
     ap.add_argument("--vs", type=str, default="MTUM,QQQ",
                     help="also buy-and-hold these REAL tradeable funds. MTUM is a "
                          "live momentum ETF: its record includes every name that "
@@ -55,6 +59,8 @@ def main() -> int:
         return 1
     logger.info("fetched {} symbols", len(universe))
 
+    from dataclasses import replace as _replace
+
     rows = []
     for name, fn in STRATEGIES.items():
         logger.info("running {}...", name)
@@ -65,6 +71,22 @@ def main() -> int:
             continue
         if res.metrics:
             rows.append((name, res.metrics))
+
+    # Does piling capital into the strongest name beat splitting evenly?
+    # Momentum RANK carries information; the magnitude of a momentum score is
+    # a far weaker predictor, and the top-scoring name is usually the most
+    # extended - so this is a question to measure, not assume.
+    for mode in [w.strip() for w in args.weightings.split(",") if w.strip()]:
+        if mode == "equal":
+            continue                       # already covered by momentum_12_1
+        logger.info("running momentum ({} weighted)...", mode)
+        try:
+            res = STRATEGIES["momentum_12_1"](universe, _replace(cfg, weighting=mode))
+        except Exception as exc:
+            logger.warning("momentum {} failed: {}", mode, exc)
+            continue
+        if res.metrics:
+            rows.append((f"momentum [{mode}]", res.metrics))
 
     # Buy-and-hold of REAL funds. These carry no survivorship bias - every
     # constituent that collapsed and was removed is already in their record -
