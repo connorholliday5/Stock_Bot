@@ -129,15 +129,36 @@ class PositionSize:
         return self.units > 0.0 and self.notional > 0.0
 
 
+def stock_position_cap(max_positions: int) -> float:
+    """Per-position notional cap as a fraction of equity.
+
+    STOCK_MAX_POSITION_PCT when set, else auto = 1 / max_positions. The auto
+    default exists because risk-based sizing computes
+        notional = equity * risk_per_trade / stop_distance_pct
+    so the shipped 2% risk with a 5% stop is a FORTY percent position: cash
+    is exhausted after ~2.5 of them and the configured 8-position portfolio
+    never materialises. Capping makes max_positions mean what it says.
+    """
+    configured = float(getattr(settings, "stock_max_position_pct", 0.0) or 0.0)
+    if configured > 0:
+        return min(configured, 1.0)
+    n = max(int(max_positions or 1), 1)
+    return 1.0 / n
+
+
 def stock_params(
     risk_per_trade: float = STOCK_RISK_PER_TRADE,
     max_heat: float = STOCK_MAX_HEAT,
-    max_position_notional_pct: float = STOCK_MAX_POSITION_NOTIONAL_PCT,
+    max_position_notional_pct: Optional[float] = None,
     min_position_usd: Optional[float] = None,
     fee_rate: float = STOCK_FEE_RATE,
     slippage_pct: float = STOCK_SLIPPAGE,
     max_positions: Optional[int] = None,
 ) -> RiskParams:
+    n_positions = (max_positions if max_positions is not None
+                   else int(getattr(settings, "max_stock_positions", 8)))
+    if max_position_notional_pct is None:
+        max_position_notional_pct = stock_position_cap(n_positions)
     return RiskParams(
         asset_type=AssetType.STOCK,
         risk_per_trade=risk_per_trade,

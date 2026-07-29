@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     # it "8 positions" can be 8 versions of one bet. 1.0 disables the guard.
     max_position_correlation: float = Field(
         0.85, validation_alias="MAX_POSITION_CORRELATION")
+    # Cap on a single stock position as a fraction of equity. 0 = auto
+    # (1 / MAX_STOCK_POSITIONS), which is what makes MAX_STOCK_POSITIONS
+    # achievable at all: risk-based sizing computes
+    #   notional = equity * risk_per_trade / stop_pct
+    # so 2% risk with a 5% stop is a 40% position - cash runs out after ~2.5
+    # of them and the configured 8 never happens.
+    stock_max_position_pct: float = Field(
+        0.0, validation_alias="STOCK_MAX_POSITION_PCT")
 
     # --- Market Timing (EST) ---
     stock_buy_time: str = "09:45"

@@ -392,6 +392,33 @@ def test_effective_min_position_scales_with_equity():
     assert effective_min_position(0, 50.0) == 50.0          # unknown equity: configured
 
 
+def test_configured_position_count_is_actually_achievable():
+    """MAX_STOCK_POSITIONS was fiction: 2% risk / 5% stop = a 40% position,
+    so cash died after ~2.5 and the bot ran a concentrated 2-3 name book
+    while reporting a max of 8. The notional cap makes the config real."""
+    from risk.manager import size_position, stock_params
+    params = stock_params(max_positions=8)
+    equity = cash = 10_000.0
+    filled = 0
+    for _ in range(12):
+        ps = size_position(params, equity=equity, available_cash=cash,
+                           entry_price=100.0, stop_price=95.0)
+        if not ps.tradable:
+            break
+        filled += 1
+        cash -= ps.notional
+        assert ps.notional <= equity * 0.126     # ~1/8 of equity
+    assert filled == 8
+
+
+def test_position_cap_honours_explicit_setting(monkeypatch):
+    import risk.manager as rm
+    monkeypatch.setattr(rm.settings, "stock_max_position_pct", 0.25, raising=False)
+    assert rm.stock_position_cap(8) == pytest.approx(0.25)
+    monkeypatch.setattr(rm.settings, "stock_max_position_pct", 0.0, raising=False)
+    assert rm.stock_position_cap(4) == pytest.approx(0.25)   # auto = 1/4
+
+
 def test_small_account_can_size_a_position():
     """A $230 account with a 5% stop must produce a tradable position - the
     old fixed $50 floor plus haircuts used to lock small accounts out."""
