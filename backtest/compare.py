@@ -27,6 +27,11 @@ def main() -> int:
     ap.add_argument("--ma", type=int, default=200, help="trend-filter MA window")
     ap.add_argument("--include-rotation", action="store_true",
                     help="also run the bot's current weekly rotation (slow)")
+    ap.add_argument("--vs", type=str, default="MTUM,QQQ",
+                    help="also buy-and-hold these REAL tradeable funds. MTUM is a "
+                         "live momentum ETF: its record includes every name that "
+                         "blew up and left the index, so it is the reality check "
+                         "on a survivorship-biased momentum backtest. Empty to skip.")
     args = ap.parse_args()
 
     from backtest.lab import LabConfig, STRATEGIES
@@ -37,8 +42,10 @@ def main() -> int:
                     top_n=args.top_n, ma_window=args.ma)
 
     symbols = default_stock_universe()
-    if cfg.benchmark not in symbols:
-        symbols.append(cfg.benchmark)
+    extras = [s.strip().upper() for s in args.vs.split(",") if s.strip()]
+    for s in [cfg.benchmark] + extras:
+        if s not in symbols:
+            symbols.append(s)
 
     lookback = int(args.years * 365) + 500        # + warmup for 12m momentum
     logger.info("fetching {} days...", lookback)
@@ -58,6 +65,22 @@ def main() -> int:
             continue
         if res.metrics:
             rows.append((name, res.metrics))
+
+    # Buy-and-hold of REAL funds. These carry no survivorship bias - every
+    # constituent that collapsed and was removed is already in their record -
+    # so they are the honest floor a stock-picking backtest must clear.
+    from backtest.lab import backtest_buy_hold
+    for sym in extras:
+        if sym not in universe:
+            logger.warning("{} not available; skipping", sym)
+            continue
+        try:
+            res = backtest_buy_hold(universe, cfg, symbol=sym)
+        except Exception as exc:
+            logger.warning("{} buy-hold failed: {}", sym, exc)
+            continue
+        if res.metrics:
+            rows.append((f"hold {sym}", res.metrics))
 
     if args.include_rotation:
         logger.info("running current weekly rotation...")
