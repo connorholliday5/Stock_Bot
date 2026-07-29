@@ -89,16 +89,49 @@ def _unpaused():
     bot_state.resume()
 
 
+@pytest.fixture(autouse=True)
+def _rotation_strategy(monkeypatch):
+    """Most of this file exercises the LEGACY weekly-rotation jobs, which now
+    no-op unless STOCK_STRATEGY=rotation (momentum is the live default, and
+    the two must never trade the same cash)."""
+    monkeypatch.setattr(S.settings, "stock_strategy", "rotation", raising=False)
+
+
 # --------------------------- registration ---------------------------
 
-def test_nine_jobs_registered():
+def test_all_jobs_registered():
     sched = S.build_scheduler()
     ids = sorted(j.id for j in sched.get_jobs())
     assert ids == sorted([
         "sunday_stock_scan", "sunday_ml_retrain", "monday_stock_buys",
         "midweek_stock_monitor", "friday_stock_sells", "crypto_cycle",
         "crypto_stop_monitor", "weekly_performance_report", "daily_heartbeat",
+        "monthly_momentum_rebalance",
     ])
+
+
+def test_momentum_rebalance_is_first_monday_monthly():
+    sched = S.build_scheduler()
+    trig = _trigger_str(sched, "monthly_momentum_rebalance")
+    assert "day='1-7'" in trig and "day_of_week='mon'" in trig
+
+
+def test_strategies_never_trade_the_same_cash(monkeypatch):
+    """With momentum live, the falsified weekly rotation must stay dormant."""
+    monkeypatch.setattr(S.settings, "stock_strategy", "momentum", raising=False)
+    called = {"buys": 0, "sells": 0}
+    monkeypatch.setattr(S.stock_weekly, "run_stock_weekly_buys",
+                        lambda **k: called.__setitem__("buys", called["buys"] + 1))
+    monkeypatch.setattr(S.stock_weekly, "run_stock_weekly_sells",
+                        lambda **k: called.__setitem__("sells", called["sells"] + 1))
+    assert "skipped" in (S.monday_stock_buys() or "")
+    assert "skipped" in (S.friday_stock_sells() or "")
+    assert called == {"buys": 0, "sells": 0}
+
+
+def test_momentum_job_dormant_under_rotation(monkeypatch):
+    monkeypatch.setattr(S.settings, "stock_strategy", "rotation", raising=False)
+    assert "skipped" in (S.monthly_momentum_rebalance() or "")
 
 
 def _trigger_str(sched, job_id):

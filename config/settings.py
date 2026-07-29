@@ -123,6 +123,23 @@ class Settings(BaseSettings):
     # rotate    - Friday sells only positions that fell out of the fresh
     #             top rankings; winners keep riding (holds over weekends).
     # liquidate - legacy: sell everything Friday 3:45, flat all weekend.
+    # Which stock strategy trades live.
+    #   momentum - 12-1 cross-sectional momentum, monthly rebalance, no
+    #              stops. Backtested +202% vs SPY +67% over 5y (survivorship
+    #              caveat: MTUM, the real ETF, did 10.3% CAGR vs this 24.9%,
+    #              so expect low-to-mid teens live, not the headline).
+    #   rotation - the legacy weekly rotation. FALSIFIED: -1.6% over 3.3y
+    #              against SPY +79%. Kept only for comparison.
+    stock_strategy: str = Field("momentum", validation_alias="STOCK_STRATEGY")
+    # Concentration dial. Fewer names = more return AND more drawdown; the
+    # backtest was smooth and monotonic across 5/10/20:
+    #   top 5  -> +325%, max drawdown -52%
+    #   top 10 -> +183%, max drawdown -41%
+    #   top 20 -> +131%, max drawdown -27%
+    momentum_top_n: int = Field(10, validation_alias="MOMENTUM_TOP_N")
+    momentum_lookback: int = Field(252, validation_alias="MOMENTUM_LOOKBACK")
+    momentum_skip: int = Field(21, validation_alias="MOMENTUM_SKIP")
+
     stock_exit_mode: str = Field("rotate", validation_alias="STOCK_EXIT_MODE")
     # A held position survives Friday rotation while it ranks inside this
     # many names of the fresh scoring (top_n buys, keep_rank holds).

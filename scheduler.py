@@ -40,7 +40,7 @@ from execution.alpaca import StockExecutor
 from execution.account import get_account_snapshot
 from execution.alpaca_crypto import crypto_executor_from_settings, to_alpaca_symbol
 from runtime import bot_state
-from strategies import stock_scorer, stock_weekly, crypto_24h
+from strategies import stock_scorer, stock_weekly, crypto_24h, momentum_monthly
 
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -416,6 +416,11 @@ def _quarantine_model(auc: float) -> None:
 
 @_guarded("monday_stock_buys")
 def monday_stock_buys() -> None:
+    # The weekly rotation was falsified by backtest (-1.6% over 3.3y vs SPY
+    # +79%). It stays in the codebase for comparison but must not trade
+    # alongside momentum, or the two strategies fight over the same cash.
+    if getattr(settings, "stock_strategy", "momentum") != "rotation":
+        return "skipped: STOCK_STRATEGY != rotation"
     rm = build_risk_manager()
     if _rm_halted(rm):
         logger.warning("monday_stock_buys: RiskManager halted (monthly DD). No entries.")
@@ -496,7 +501,9 @@ def _synthesize_missing_marks(universe: dict, positions: list) -> dict:
 
 @_guarded("friday_stock_sells")
 def friday_stock_sells() -> None:
-    """Friday 3:45 exit pass. Two modes (STOCK_EXIT_MODE):
+    """Friday 3:45 exit pass (rotation strategy only).
+
+    Two modes (STOCK_EXIT_MODE):
 
     rotate (default) - re-score the universe NOW and sell only positions
       that fell out of the top ROTATION_KEEP_RANK; still-ranked winners ride
@@ -504,6 +511,8 @@ def friday_stock_sells() -> None:
       Monday-morning marks). Cuts turnover and lets momentum compound.
     liquidate - legacy: sell everything, flat over the weekend.
     """
+    if getattr(settings, "stock_strategy", "momentum") != "rotation":
+        return "skipped: STOCK_STRATEGY != rotation"
     positions = _open_positions("stock")
     if not positions:
         logger.info("friday_stock_sells: no open stock positions.")
@@ -652,6 +661,42 @@ def crypto_stop_monitor() -> None:
     return f"marks={len(prices)} closed={closed}"
 
 
+@_guarded("monthly_momentum_rebalance")
+def monthly_momentum_rebalance() -> None:
+    """The live momentum strategy: rank on 12-1 momentum, hold the top N
+    equal-weight, rebalance monthly. Runs only when STOCK_STRATEGY=momentum
+    (the default); the legacy weekly rotation jobs no-op in that mode."""
+    if getattr(settings, "stock_strategy", "momentum") != "momentum":
+        return "skipped: STOCK_STRATEGY != momentum"
+    rm = build_risk_manager()
+    if _rm_halted(rm):
+        logger.warning("monthly_momentum_rebalance: drawdown halt active. No entries.")
+        return "halted"
+    # Momentum needs ~13 months of history to rank, so pull a wider window
+    # than the weekly scan ever needed.
+    universe = _load_feature_universe(lookback_days=600)
+    if not universe:
+        logger.warning("monthly_momentum_rebalance: no data. Skipping.")
+        return "no data"
+    state = get_account_state(rm, "stock")
+    executor = StockExecutor.from_settings()
+    executor.paper_cash = state.cash
+    executor.min_position_usd = effective_min_position(state.equity)
+    result = momentum_monthly.run_monthly_rebalance(
+        universe=universe,
+        open_positions=_position_dicts(state.open_positions),
+        equity=state.equity,
+        available_cash=state.cash,
+        executor=executor,
+        top_n=int(getattr(settings, "momentum_top_n", 10)),
+        lookback=int(getattr(settings, "momentum_lookback", 252)),
+        skip=int(getattr(settings, "momentum_skip", 21)),
+        min_position_usd=executor.min_position_usd,
+    )
+    logger.info("monthly_momentum_rebalance: {}", result)
+    return f"sold={result.get('sold', 0)} bought={result.get('bought', 0)}"
+
+
 @_guarded("weekly_performance_report")
 def weekly_performance_report() -> None:
     logger.info("weekly_performance_report: building weekly P&L report")
@@ -708,6 +753,7 @@ JOBS = {
     "monday_stock_buys": monday_stock_buys,
     "midweek_stock_monitor": midweek_stock_monitor,
     "friday_stock_sells": friday_stock_sells,
+    "monthly_momentum_rebalance": monthly_momentum_rebalance,
     "crypto_cycle": crypto_cycle,
     "crypto_stop_monitor": crypto_stop_monitor,
     "weekly_performance_report": weekly_performance_report,
@@ -732,6 +778,11 @@ def register_jobs(scheduler) -> None:
     scheduler.add_job(friday_stock_sells,
                       CronTrigger(day_of_week="fri", hour=15, minute=45, timezone=tz),
                       id="friday_stock_sells", replace_existing=True)
+    # First Monday of each month, just after the open.
+    scheduler.add_job(monthly_momentum_rebalance,
+                      CronTrigger(day="1-7", day_of_week="mon", hour=9, minute=45,
+                                  timezone=tz),
+                      id="monthly_momentum_rebalance", replace_existing=True)
     scheduler.add_job(crypto_cycle,
                       CronTrigger(hour="*/4", minute=0, timezone=tz),
                       id="crypto_cycle", replace_existing=True)

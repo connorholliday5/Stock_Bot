@@ -3,12 +3,21 @@
 An automated trading bot for a single Alpaca account, with a built-in web
 dashboard. It runs two strategies side by side from the same pot of money:
 
-- **Stocks (weekly rotation):** scans and ranks the S&P 500 Sunday night,
-  buys the top-ranked names Monday 9:45 AM ET, and monitors stop-losses
-  mid-week. Friday 3:45 PM ET it re-scores the market and sells only the
-  positions that fell out of the rankings — winners keep riding so momentum
-  can compound (`STOCK_EXIT_MODE=liquidate` restores the sell-everything
-  Friday). The weekly cadence keeps API usage tiny.
+- **Stocks (monthly momentum, default):** ranks the S&P 500 on 12-month
+  return skipping the most recent month, holds the top N equal-weight, and
+  rebalances on the first Monday of each month. No stop-losses — momentum
+  exits by falling out of the ranking, and a tight stop on equity noise
+  sells dips into recoveries.
+
+  *Backtested over 5 years: +202% vs SPY +67% (Sharpe 0.81 vs 0.70), holding
+  up through the 2022 bear market and across top-N 5/10/20.* **But** MTUM —
+  the real, tradeable momentum ETF — returned 10.3% CAGR over the same
+  window against this backtest's 24.9%, and that gap is mostly survivorship
+  bias (the universe is today's index membership). Expect low-to-mid teens
+  live, not the headline.
+
+  The legacy **weekly rotation** (`STOCK_STRATEGY=rotation`) is kept for
+  comparison only: it backtested **−1.6% over 3.3 years against SPY +79%**.
 - **Crypto (24/7):** a 4-hour trend-regime strategy — long while the trend
   is intact (price above EMA200, EMAs stacked, ADX trending), flat when it
   breaks, with stops re-checked every 15 minutes. Scans BTC/ETH/SOL/LTC/
