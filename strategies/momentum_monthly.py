@@ -121,14 +121,20 @@ def run_monthly_rebalance(
     lookback: int = DEFAULT_LOOKBACK,
     skip: int = DEFAULT_SKIP,
     min_position_usd: float = 10.0,
+    topup_tolerance: float = 0.25,
 ) -> dict:
-    """Sell first (frees cash), then buy into the freed capital."""
+    """Sell dropouts (frees cash), top up underweight holds, then buy entrants.
+
+    topup_tolerance is the drift a held position may run below its target
+    weight before capital is added - it lets deposits flow in without
+    rebalancing the whole book every month.
+    """
     held_map = {(p.get("symbol") or p.get("ticker")): p for p in (open_positions or [])}
     plan = build_rebalance_plan(universe, list(held_map), equity, top_n, lookback, skip)
     if not plan.targets:
         return {"status": "no_targets", **plan.as_dict()}
 
-    sold = bought = 0
+    sold = bought = topped = 0
     cash = float(available_cash)
 
     for symbol in plan.sells:
@@ -142,6 +148,34 @@ def run_monthly_rebalance(
         if result.get("status") == "filled":
             sold += 1
             cash += price * float(pos.get("quantity", 0.0) or 0.0)
+
+    # Top up positions that are already held but sit below target weight.
+    # Without this, deposited cash NEVER gets invested when the rankings do
+    # not change: only new entrants were ever bought, so contributions would
+    # pile up as idle cash forever. A tolerance band keeps this from churning
+    # the book on small drifts.
+    for symbol in plan.targets:
+        if symbol in plan.buys or executor is None:
+            continue
+        pos = held_map.get(symbol) or {}
+        price = _last_close(universe, symbol) or float(
+            pos.get("current_price") or pos.get("entry_price") or 0.0)
+        if price <= 0:
+            continue
+        current_value = float(pos.get("quantity", 0.0) or 0.0) * price
+        shortfall = plan.target_value - current_value
+        if (shortfall <= 0 or plan.target_value <= 0
+                or shortfall / plan.target_value < topup_tolerance):
+            continue
+        spend = min(shortfall, cash)
+        if spend < min_position_usd:
+            continue
+        result = executor.open_long(symbol=symbol, units=spend / price,
+                                    entry_price=price, stop_loss=0.0,
+                                    take_profit=0.0)
+        if result.get("status") == "filled":
+            topped += 1
+            cash -= spend
 
     for symbol in plan.buys:
         price = _last_close(universe, symbol)
@@ -161,8 +195,10 @@ def run_monthly_rebalance(
             bought += 1
             cash -= spend
 
-    logger.info("momentum rebalance: sold=%d bought=%d cash_left=$%.2f", sold, bought, cash)
-    return {"status": "ok", "sold": sold, "bought": bought, **plan.as_dict()}
+    logger.info("momentum rebalance: sold=%d bought=%d topped_up=%d cash_left=$%.2f",
+                sold, bought, topped, cash)
+    return {"status": "ok", "sold": sold, "bought": bought, "topped_up": topped,
+            **plan.as_dict()}
 
 
 def top_n_from_settings() -> int:

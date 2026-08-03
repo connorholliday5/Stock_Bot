@@ -138,6 +138,32 @@ def test_rebalance_respects_available_cash():
     assert len(ex.opened) <= 2
 
 
+def test_deposited_cash_gets_invested_when_rankings_are_unchanged():
+    """The contribution bug: only NEW entrants were ever bought, so a deposit
+    made while the top-N was stable would sit as idle cash forever."""
+    ex = FakeExecutor()
+    # already holding both targets, but underweight after a $5,000 deposit
+    held = [{"symbol": "WINNER", "quantity": 10.0, "current_price": 100.0},
+            {"symbol": "GOOD", "quantity": 10.0, "current_price": 100.0}]
+    result = run_monthly_rebalance(_universe(), held, equity=10_000.0,
+                                   available_cash=5_000.0, executor=ex, top_n=2)
+    assert result["sold"] == 0          # rankings unchanged, nothing to rotate
+    assert result["topped_up"] == 2     # both holds topped toward target
+    assert ex.opened                    # cash actually deployed
+
+
+def test_topup_tolerance_prevents_churn_on_small_drift():
+    ex = FakeExecutor()
+    # each already ~at its $5,000 target; a tiny drift must not trade
+    held = [{"symbol": "WINNER", "quantity": 24.0, "current_price": 200.0},
+            {"symbol": "GOOD", "quantity": 35.0, "current_price": 140.0}]
+    result = run_monthly_rebalance(_universe(), held, equity=10_000.0,
+                                   available_cash=100.0, executor=ex,
+                                   top_n=2, topup_tolerance=0.25)
+    assert result["topped_up"] == 0
+    assert ex.opened == []
+
+
 def test_rebalance_without_executor_still_plans():
     result = run_monthly_rebalance(_universe(), [], equity=1_000.0,
                                    available_cash=1_000.0, executor=None, top_n=2)
