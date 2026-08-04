@@ -85,6 +85,15 @@ class Membership:
     dates: list[pd.Timestamp]
     sets: list[frozenset[str]]
 
+    def __post_init__(self) -> None:
+        # members_on binary-searches `dates`, which silently returns the
+        # wrong snapshot if the file is ever published out of order. Sorting
+        # here costs nothing and removes the failure mode entirely.
+        if self.dates != sorted(self.dates):
+            order = sorted(range(len(self.dates)), key=lambda i: self.dates[i])
+            self.dates = [self.dates[i] for i in order]
+            self.sets = [self.sets[i] for i in order]
+
     def __len__(self) -> int:
         return len(self.dates)
 
@@ -162,6 +171,8 @@ def load_membership(force: bool = False) -> Membership:
     global _CACHE, _WARNED
     if _CACHE is not None and not force:
         return _CACHE
+    if force:
+        _WARNED = False
     try:
         if not SNAPSHOT_FILE.exists():
             raise FileNotFoundError(SNAPSHOT_FILE)

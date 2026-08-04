@@ -18,8 +18,8 @@ import pandas as pd
 import pytest
 
 from backtest.leakage import (
-    LeakReport, check_features, check_strategy_path, perturb_after,
-    warmup_sensitivity,
+    LeakReport, check_features, check_scores, check_strategy_path,
+    perturb_after, warmup_sensitivity,
 )
 from data.fetcher import add_features
 
@@ -48,6 +48,15 @@ def test_real_indicators_have_no_look_ahead():
     rep = check_features(_ohlcv(1), "T", n_dates=5, warmup=250)
     assert rep.checks > 0, "check ran zero comparisons - it is not testing anything"
     assert rep.clean, f"leak in production indicators: {[str(l) for l in rep.leaks]}"
+
+
+def test_the_composite_ranking_has_no_look_ahead():
+    """The score the scheduler actually ranks on, end to end through
+    add_features -> score_universe."""
+    raw = {f"T{i:02d}": _ohlcv(30 + i) for i in range(4)}
+    rep = check_scores(raw, n_dates=3, warmup=250)
+    assert rep.checks > 0, "check_scores ran zero comparisons"
+    assert rep.clean, f"composite score leaked: {[str(l) for l in rep.leaks][:3]}"
 
 
 def test_momentum_backtest_ignores_the_future():
@@ -155,6 +164,36 @@ def test_perturbation_only_touches_bars_after_the_cut():
         assert not np.allclose(after.to_numpy(),
                                uni[sym].loc[uni[sym].index > cut, "close"].to_numpy()), \
             f"{sym}: perturbation left the future unchanged - the test is inert"
+
+
+def test_perturbation_reaches_derived_indicators_not_just_prices():
+    """Mangling only OHLCV would leave sma_50, rsi, macd intact after the
+    cut, so a strategy that peeked at a future INDICATOR rather than a
+    future price would go undetected."""
+    uni = _universe(2)
+    cut = uni["SPY"].index[300]
+    mangled = perturb_after(uni, cut)
+    df, orig = mangled["T00"], uni["T00"]
+    future = df.index > cut
+    for col in ("sma_50", "rsi", "macd", "atr", "above_sma50"):
+        assert col in df.columns, f"{col} missing - test universe changed"
+        a = df.loc[future, col].to_numpy(dtype="float64", na_value=0.0)
+        b = orig.loc[future, col].to_numpy(dtype="float64", na_value=0.0)
+        assert not np.allclose(a, b), f"{col} survived the perturbation untouched"
+
+
+def test_perturbation_leaves_pre_cut_indicators_bit_identical():
+    """The other half of the contract: if the past moved at all, every leak
+    this reports would be an artifact of the test itself."""
+    uni = _universe(2)
+    cut = uni["SPY"].index[300]
+    mangled = perturb_after(uni, cut)
+    df, orig = mangled["T00"], uni["T00"]
+    past = df.index <= cut
+    for col in ("sma_50", "rsi", "macd", "atr", "close", "volume"):
+        a = df.loc[past, col].to_numpy(dtype="float64", na_value=0.0)
+        b = orig.loc[past, col].to_numpy(dtype="float64", na_value=0.0)
+        assert np.array_equal(a, b), f"{col}: perturbation corrupted the past"
 
 
 # --------------------------- warm-up (not leakage) ---------------------------

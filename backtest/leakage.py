@@ -143,7 +143,7 @@ def check_features(raw: pd.DataFrame, symbol: str = "?", n_dates: int = 8,
             continue
         a, b = trunc.loc[date], full.loc[date]
         for col in trunc.columns:
-            if col not in full.index and col not in full.columns:
+            if col not in full.columns:
                 continue
             x, y = _num(a.get(col)), _num(b.get(col))
             report.checks += 1
@@ -181,7 +181,7 @@ def check_scores(raw_universe: dict[str, pd.DataFrame], n_dates: int = 6,
     symbols = [s for s, d in raw_universe.items() if d is not None and len(d)]
     if not symbols:
         return report
-    index = raw_universe[symbols[0]].index
+    index = max((raw_universe[s].index for s in symbols), key=len)
     dates = _sample_dates(index, n_dates, warmup)
     if not dates:
         report.notes.append("scores: not enough history")
@@ -230,9 +230,15 @@ def perturb_after(universe: dict[str, pd.DataFrame], date,
                   factor: float = 3.0, seed: int = 7) -> dict[str, pd.DataFrame]:
     """Return a copy of `universe` with every bar AFTER `date` mangled.
 
-    Prices after the cut are scaled and randomized beyond recognition. Any
-    signal, indicator or sizing rule that consults them will visibly change;
-    one that respects causality cannot notice at all.
+    EVERY numeric column after the cut is scaled and randomized beyond
+    recognition - not just OHLCV. Mangling only raw prices would leave the
+    precomputed indicators (sma_50, rsi, macd...) intact after the cut, so a
+    strategy that peeked at a future INDICATOR rather than a future price
+    would sail through undetected. The columns are the interface; perturb
+    all of them.
+
+    Any signal, indicator or sizing rule that consults a post-cut bar will
+    visibly change. One that respects causality cannot notice at all.
     """
     rng = np.random.default_rng(seed)
     ts = pd.Timestamp(date)
@@ -247,11 +253,14 @@ def perturb_after(universe: dict[str, pd.DataFrame], date,
             out[sym] = new
             continue
         noise = factor * (1.0 + rng.normal(0, 0.5, n))
-        for col in ("open", "high", "low", "close", "vwap_calc"):
-            if col in new.columns:
-                new.loc[future, col] = new.loc[future, col].to_numpy() * noise
-        if "volume" in new.columns:
-            new.loc[future, "volume"] = new.loc[future, "volume"].to_numpy() * 5.0
+        for col in new.columns:
+            if not pd.api.types.is_numeric_dtype(new[col]):
+                continue
+            values = new.loc[future, col].to_numpy(dtype="float64", na_value=np.nan)
+            # +1 shifts binary flags (above_sma50, golden_cross) off 0/1 too,
+            # so reading one after the cut is just as visible as reading a price.
+            new[col] = new[col].astype("float64")
+            new.loc[future, col] = (values + 1.0) * noise
         out[sym] = new
     return out
 

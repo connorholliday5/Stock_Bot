@@ -104,24 +104,24 @@ def test_missing_data_passes_symbols_through_unchanged():
 
 # --------------------------- the real dataset ---------------------------
 
-pytestmark_real = pytest.mark.skipif(not is_available(),
+requires_dataset = pytest.mark.skipif(not is_available(),
                                      reason="membership dataset not present")
 
 
-@pytestmark_real
+@requires_dataset
 def test_real_dataset_covers_our_backtest_window():
     lo, hi = load_membership().coverage
     assert lo <= pd.Timestamp("1996-01-31")
     assert hi >= pd.Timestamp("2025-01-01"), "coverage must reach recent history"
 
 
-@pytestmark_real
+@requires_dataset
 def test_real_snapshots_are_index_sized():
     for d in ("2000-06-30", "2010-06-30", "2020-06-30"):
         assert 450 <= len(members_on(d)) <= 520, f"{d} membership looks wrong"
 
 
-@pytestmark_real
+@requires_dataset
 def test_tesla_is_absent_before_its_2020_addition():
     """A concrete, checkable fact. TSLA joined the S&P 500 in Dec 2020; a
     momentum backtest that ranks it in 2015 is trading on hindsight."""
@@ -130,14 +130,14 @@ def test_tesla_is_absent_before_its_2020_addition():
     assert "TSLA" in members_on("2021-06-01")
 
 
-@pytestmark_real
+@requires_dataset
 def test_enron_is_present_before_it_collapsed():
     """The bias runs both ways: the corrected universe must still contain
     the names that later blew up, not just the survivors."""
     assert "ENRNQ" in members_on("1998-01-02")
 
 
-@pytestmark_real
+@requires_dataset
 def test_nvidia_is_absent_in_the_nineties():
     assert "NVDA" not in members_on("1997-01-02")
     assert "NVDA" in members_on("2010-01-04")
@@ -156,7 +156,7 @@ def _frame(seed: int, n: int = 700) -> pd.DataFrame:
          "close": close, "volume": rng.uniform(1e6, 2e6, n)}, index=dates))
 
 
-@pytestmark_real
+@requires_dataset
 def test_momentum_only_holds_names_that_were_index_members():
     """Real tickers, half of them not in the index during the window: the
     non-members must never be bought."""
@@ -175,7 +175,7 @@ def test_momentum_only_holds_names_that_were_index_members():
     assert res.metrics["trades"] <= off.metrics["trades"]
 
 
-@pytestmark_real
+@requires_dataset
 def test_engine_filter_actually_bites():
     """Proof the wiring is live, not just present: with the filter ON, a
     universe of non-members produces no entries at all. If this ever passes
@@ -191,7 +191,7 @@ def test_engine_filter_actually_bites():
     assert off.metrics.get("trades", 0) > 0
 
 
-@pytestmark_real
+@requires_dataset
 def test_engine_keeps_scoring_a_holding_after_it_leaves_the_index():
     """Leaving the index is not a reason to stop evaluating a position we
     own - it must still be exitable, so held names bypass the filter."""
