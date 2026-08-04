@@ -170,6 +170,20 @@ it in Task Scheduler with a "When the computer starts" trigger — the file's
 header comments have the exact steps. Also set Power → Sleep → Never; a
 sleeping PC stops watching your stops.
 
+**Do not keep this repo in OneDrive, Dropbox or Google Drive.** Sync races
+rewrite files underneath processes that are still using them, which breaks
+things in two ways that are hard to diagnose:
+
+- Git updates refs with a compare-and-swap. When the sync client restores a
+  ref mid-update, `git pull` fails with `incorrect old value provided` — and
+  it fails *after* printing the commit range, so it looks like it worked
+  while the working tree stays on old code.
+- `data_store/stockbot.db` is written live by the scheduler. A sync client
+  copying it mid-transaction can corrupt your trade history.
+
+Put it somewhere local (`C:\Programming\stock_bot`), or exclude the folder in
+OneDrive → Settings → Choose folders.
+
 ## Development
 
 ```bash
