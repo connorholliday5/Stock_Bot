@@ -35,10 +35,19 @@ def _universe(n: int = 20) -> dict:
     return uni
 
 
+def _cfg(**kw) -> LabConfig:
+    """These are synthetic tickers (T00...), so the point-in-time S&P
+    membership filter would correctly reject every one of them and momentum
+    would trade nothing. This file tests mechanics - cadence, weighting,
+    costs - not membership; that lives in test_phase16_pit.py."""
+    kw.setdefault("point_in_time_membership", False)
+    return LabConfig(**kw)
+
+
 def test_all_strategies_produce_metrics():
     uni = _universe()
     for name, fn in STRATEGIES.items():
-        res = fn(uni, LabConfig())
+        res = fn(uni, _cfg())
         assert res.metrics, f"{name} produced no metrics"
         assert not res.equity.empty
         assert res.equity.index.is_monotonic_increasing
@@ -46,7 +55,7 @@ def test_all_strategies_produce_metrics():
 
 def test_buy_hold_trades_once_and_tracks_the_asset():
     uni = _universe()
-    res = backtest_buy_hold(uni, LabConfig())
+    res = backtest_buy_hold(uni, _cfg())
     assert res.metrics["trades"] == 1          # one entry, never sells
     # return should track SPY closely (cost drag only)
     assert abs(res.metrics["total_return_pct"]
@@ -55,20 +64,20 @@ def test_buy_hold_trades_once_and_tracks_the_asset():
 
 def test_trend_filter_trades_rarely():
     """The whole point: a few round trips a year, so costs cannot eat it."""
-    res = backtest_trend_filter(_universe(), LabConfig())
+    res = backtest_trend_filter(_universe(), _cfg())
     assert res.metrics["trades"] < 40          # vs 261 for weekly rotation
 
 
 def test_trend_filter_reduces_drawdown_vs_buy_hold():
     uni = _universe()
-    bh = backtest_buy_hold(uni, LabConfig())
-    tf = backtest_trend_filter(uni, LabConfig())
+    bh = backtest_buy_hold(uni, _cfg())
+    tf = backtest_trend_filter(uni, _cfg())
     # sitting in cash below the MA cannot deepen the worst drawdown
     assert tf.metrics["max_drawdown_pct"] >= bh.metrics["max_drawdown_pct"] - 1e-6
 
 
 def test_momentum_rebalances_monthly_not_weekly():
-    res = backtest_momentum(_universe(20), LabConfig(top_n=5))
+    res = backtest_momentum(_universe(20), _cfg(top_n=5))
     # ~36 months x (5 sells + 5 buys) is the right order of magnitude;
     # weekly churn would be several times this
     assert 0 < res.metrics["trades"] < 600
@@ -77,7 +86,7 @@ def test_momentum_rebalances_monthly_not_weekly():
 def test_momentum_skip_window_is_applied():
     """12-1 means the most recent month is EXCLUDED from the ranking - the
     skip is what avoids short-term reversal contaminating the signal."""
-    cfg = LabConfig(momentum_lookback=252, momentum_skip=21)
+    cfg = _cfg(momentum_lookback=252, momentum_skip=21)
     assert cfg.momentum_skip > 0
     res = backtest_momentum(_universe(12), cfg)
     assert res.metrics
@@ -86,7 +95,7 @@ def test_momentum_skip_window_is_applied():
 def test_weighting_modes_all_run_and_stay_invested():
     uni = _universe(20)
     for mode in ("equal", "rank", "score"):
-        res = backtest_momentum(uni, LabConfig(weighting=mode, top_n=5))
+        res = backtest_momentum(uni, _cfg(weighting=mode, top_n=5))
         assert res.metrics, f"{mode} produced nothing"
         assert (res.equity > 0).all()
 
@@ -114,21 +123,21 @@ def test_score_weighting_survives_all_negative_scores():
 
 def test_costs_scale_with_turnover():
     uni = _universe()
-    cheap = backtest_trend_filter(uni, LabConfig(cost_bps=1.0))
-    dear = backtest_trend_filter(uni, LabConfig(cost_bps=100.0))
+    cheap = backtest_trend_filter(uni, _cfg(cost_bps=1.0))
+    dear = backtest_trend_filter(uni, _cfg(cost_bps=100.0))
     assert dear.metrics["total_costs"] > cheap.metrics["total_costs"]
     assert dear.metrics["total_return_pct"] <= cheap.metrics["total_return_pct"] + 1e-9
 
 
 def test_insufficient_history_is_clean():
     tiny = {"SPY": _frame(1, n=40)}
-    assert backtest_buy_hold(tiny, LabConfig()).equity.empty
-    assert backtest_trend_filter(tiny, LabConfig()).equity.empty
-    assert backtest_momentum(tiny, LabConfig()).equity.empty
+    assert backtest_buy_hold(tiny, _cfg()).equity.empty
+    assert backtest_trend_filter(tiny, _cfg()).equity.empty
+    assert backtest_momentum(tiny, _cfg()).equity.empty
 
 
 def test_equity_never_goes_negative():
     uni = _universe()
     for fn in (backtest_buy_hold, backtest_trend_filter, backtest_momentum):
-        res = fn(uni, LabConfig())
+        res = fn(uni, _cfg())
         assert (res.equity > 0).all()

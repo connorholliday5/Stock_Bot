@@ -46,6 +46,16 @@ def _universe(n_tickers: int = 12, **kw) -> dict[str, pd.DataFrame]:
     return uni
 
 
+def _cfg(**kw) -> BacktestConfig:
+    """Synthetic tickers (T00...) are not S&P 500 members, so the
+    point-in-time membership filter would correctly reject every candidate
+    and the engine would trade nothing - making every assertion below
+    vacuously true. This file tests engine mechanics; membership itself is
+    covered in test_phase16_pit.py."""
+    kw.setdefault("point_in_time_membership", False)
+    return BacktestConfig(**kw)
+
+
 # ---------------------------------------------------------------------------
 # point-in-time discipline
 # ---------------------------------------------------------------------------
@@ -70,7 +80,7 @@ def test_slice_universe_drops_short_history():
 # ---------------------------------------------------------------------------
 
 def test_backtest_runs_and_reports_metrics():
-    res = run_backtest(_universe(10), BacktestConfig(warmup_bars=210))
+    res = run_backtest(_universe(10), _cfg(warmup_bars=210))
     assert res.metrics, "expected metrics"
     assert not res.equity.empty
     assert res.equity.index.is_monotonic_increasing
@@ -80,7 +90,7 @@ def test_backtest_runs_and_reports_metrics():
 
 
 def test_equity_starts_at_initial_capital():
-    cfg = BacktestConfig(warmup_bars=210, initial_capital=5_000.0)
+    cfg = _cfg(warmup_bars=210, initial_capital=5_000.0)
     res = run_backtest(_universe(8), cfg)
     # first marked bar happens before any fill, so equity == starting cash
     assert res.equity.iloc[0] == pytest.approx(5_000.0)
@@ -88,14 +98,14 @@ def test_equity_starts_at_initial_capital():
 
 def test_insufficient_history_is_a_clean_no_op():
     short = {"AAA": _frame(1, n=50)}
-    res = run_backtest(short, BacktestConfig(warmup_bars=200))
+    res = run_backtest(short, _cfg(warmup_bars=200))
     assert res.equity.empty and res.metrics == {}
 
 
 def test_costs_are_actually_charged():
     """A run that trades must report non-zero costs; zero would mean the
     cost model silently isn't wired (the classic too-good backtest)."""
-    cfg = BacktestConfig(warmup_bars=210, cost_bps=50.0)
+    cfg = _cfg(warmup_bars=210, cost_bps=50.0)
     res = run_backtest(_universe(10), cfg)
     if res.metrics.get("trades", 0) > 0:
         assert res.metrics["total_costs"] > 0
@@ -103,14 +113,14 @@ def test_costs_are_actually_charged():
 
 def test_higher_costs_never_improve_results():
     uni = _universe(10)
-    cheap = run_backtest(uni, BacktestConfig(warmup_bars=210, cost_bps=1.0))
-    dear = run_backtest(uni, BacktestConfig(warmup_bars=210, cost_bps=100.0))
+    cheap = run_backtest(uni, _cfg(warmup_bars=210, cost_bps=1.0))
+    dear = run_backtest(uni, _cfg(warmup_bars=210, cost_bps=100.0))
     if cheap.metrics.get("trades", 0) > 0:
         assert dear.metrics["total_return_pct"] <= cheap.metrics["total_return_pct"] + 1e-9
 
 
 def test_positions_never_exceed_top_n():
-    cfg = BacktestConfig(warmup_bars=210, top_n=3)
+    cfg = _cfg(warmup_bars=210, top_n=3)
     res = run_backtest(_universe(12), cfg)
     by_date: dict = {}
     for t in res.trades:
@@ -123,7 +133,7 @@ def test_positions_never_exceed_top_n():
 
 
 def test_no_negative_cash_implied_by_equity():
-    res = run_backtest(_universe(10), BacktestConfig(warmup_bars=210))
+    res = run_backtest(_universe(10), _cfg(warmup_bars=210))
     assert (res.equity > 0).all()
 
 
@@ -151,12 +161,12 @@ def test_benchmark_is_reported_when_present():
     strategy beats doing nothing. Regression: SPY is an ETF, never an index
     constituent, so the default universe omitted it and the comparison was
     silently nan."""
-    res = run_backtest(_universe(8), BacktestConfig(warmup_bars=210))
+    res = run_backtest(_universe(8), _cfg(warmup_bars=210))
     assert not res.benchmark.empty
     assert res.metrics["benchmark_return_pct"] == res.metrics["benchmark_return_pct"]
 
 
 def test_summary_is_printable():
-    res = run_backtest(_universe(8), BacktestConfig(warmup_bars=210))
+    res = run_backtest(_universe(8), _cfg(warmup_bars=210))
     text = res.summary()
     assert "Return" in text and "Max drawdown" in text

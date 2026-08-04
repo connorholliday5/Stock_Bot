@@ -18,10 +18,17 @@ stop with realistic gap fills (a gap-down opens below the stop, so the fill
 is the open, not the stop), weekly rotation with the real keep-rank rule,
 risk-based position sizing, and a cash constraint (no margin).
 
+Design rule #3: candidates are filtered to the index members as of the
+decision date (data/index_membership.py), so the engine cannot rank a
+company that had not joined the index yet. Set
+BacktestConfig.point_in_time_membership=False to measure how much that
+correction is worth.
+
 What is NOT modeled - read before trusting a number:
-  - Survivorship: the ticker list is TODAY's index membership, so names that
-    were delisted or dropped never appear. This flatters results, sometimes
-    substantially. Treat absolute returns as optimistic.
+  - Survivorship, PARTIALLY corrected. Point-in-time membership stops us
+    ranking names before they joined, but Alpaca has no bars for companies
+    delisted years ago, so the losers that died cannot be traded in replay.
+    Absolute returns remain optimistic, just less so.
   - Intrabar path: only OHLC is known, so a bar that touches both stop and
     target is resolved stop-first (conservative).
   - Dividends, borrow, taxes.
@@ -36,6 +43,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from data.index_membership import filter_to_members
 from risk.manager import size_position, stock_params
 from strategies import stock_scorer
 from strategies.stock_weekly import select_rotation_exits
@@ -55,6 +63,9 @@ class BacktestConfig:
     risk_per_trade: float = 0.02
     warmup_bars: int = 200            # need SMA200 before the first decision
     benchmark: str = "SPY"
+    # Rank only names that were in the index on the decision date. Off = the
+    # old survivorship-biased behaviour, kept so the difference is measurable.
+    point_in_time_membership: bool = True
 
 
 @dataclass
@@ -137,6 +148,21 @@ def _slice_universe(universe: dict, upto: pd.Timestamp, min_bars: int) -> dict:
         if len(sub) >= min_bars:
             out[sym] = sub
     return out
+
+
+def _restrict_to_members(pit: dict, date: pd.Timestamp, keep=()) -> dict:
+    """Drop names that were not in the index on `date`.
+
+    `keep` is passed the currently-open positions so an existing holding is
+    still scored (and can still be exited) after it leaves the index.
+
+    When membership data is unavailable `members_on` returns an empty set;
+    that means "unknown", so the universe passes through untouched rather
+    than being emptied.
+    """
+    keep = set(keep)
+    eligible = set(filter_to_members([s for s in pit if s not in keep], date))
+    return {s: df for s, df in pit.items() if s in eligible or s in keep}
 
 
 def _bar(df: pd.DataFrame, date: pd.Timestamp) -> Optional[pd.Series]:
@@ -316,6 +342,12 @@ def run_backtest(
             continue
 
         pit = _slice_universe(universe, today, cfg.warmup_bars)
+        # Only rank what was actually in the index on this date. Names we
+        # already hold stay in `pit` so their exit signal is still computed -
+        # dropping out of the index is not a reason to stop scoring a
+        # position we own.
+        if cfg.point_in_time_membership:
+            pit = _restrict_to_members(pit, today, keep=open_pos.keys())
         if not pit:
             continue
         try:

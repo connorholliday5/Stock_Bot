@@ -25,7 +25,9 @@ The variants, cheapest-to-believe first:
 
 All three use the same point-in-time discipline as the main engine:
 decisions on bar T use data through T and execute at T+1's open, with
-per-side costs charged.
+per-side costs charged, and momentum ranks only names that were in the index
+on the decision date (data/index_membership.py). That last part is a PARTIAL
+survivorship correction - see that module's docstring for what it cannot fix.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ import numpy as np
 import pandas as pd
 
 from backtest.engine import BacktestConfig, BacktestResult, _metrics, _trading_dates
+from data.index_membership import filter_to_members
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,9 @@ class LabConfig:
     #   rank  - linear decay, best name gets the largest slice
     #   score - proportional to the momentum score itself (most aggressive)
     weighting: str = "equal"
+    # Rank only index members as of the decision date. Off = the old
+    # survivorship-biased behaviour, kept so the difference is measurable.
+    point_in_time_membership: bool = True
 
 
 def _px(df: pd.DataFrame, date, col: str = "close") -> Optional[float]:
@@ -249,6 +255,11 @@ def backtest_momentum(universe: dict, cfg: Optional[LabConfig] = None) -> Backte
         past = hist.iloc[-(cfg.momentum_lookback + 1)]
         recent = hist.iloc[-(cfg.momentum_skip + 1)]
         mom = (recent / past - 1.0).replace([np.inf, -np.inf], np.nan).dropna()
+        # Rank only what was in the index on this date. An empty membership
+        # set means the data is unavailable ("unknown"), not that nothing is
+        # eligible - so leave `mom` alone rather than emptying the book.
+        if cfg.point_in_time_membership:
+            mom = mom.loc[filter_to_members(list(mom.index), today)]
         if mom.empty:
             continue
         top = mom.sort_values(ascending=False).head(cfg.top_n)
