@@ -151,6 +151,31 @@ def test_detector_catches_a_strategy_that_peeks():
     assert not rep.clean, "a strategy reading 5 bars ahead went undetected"
 
 
+def test_empty_strategy_result_is_a_note_not_a_crash():
+    """The first real-data run crashed here: an empty BacktestResult carries
+    a RangeIndex, and slicing it against a Timestamp raises. Nothing-to-test
+    must surface as a note - never a traceback, never a silent pass."""
+    from backtest.engine import BacktestResult
+
+    def produces_nothing(universe, cfg=None):
+        return BacktestResult()
+
+    rep = check_strategy_path(produces_nothing, _universe(3))
+    assert rep.checks == 0
+    assert rep.clean                       # no leaks - but also no evidence
+    assert any("NOTHING was tested" in n for n in rep.notes)
+
+
+def test_trend_filter_without_benchmark_is_a_note_not_a_crash():
+    """The exact real-world trigger: the first 12 S&P tickers are A..ADSK,
+    no SPY, so trend_filter has no benchmark and returns an empty result."""
+    from backtest.lab import LabConfig, backtest_trend_filter
+    uni = {f"T{i:02d}": add_features(_ohlcv(10 + i)) for i in range(4)}  # no SPY
+    cfg = LabConfig(point_in_time_membership=False)
+    rep = check_strategy_path(backtest_trend_filter, uni, cfg)
+    assert rep.checks == 0 and rep.notes
+
+
 # --------------------------- the perturbation itself ---------------------------
 
 def test_perturbation_only_touches_bars_after_the_cut():

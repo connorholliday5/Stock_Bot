@@ -303,6 +303,16 @@ def check_strategy_path(strategy_fn, universe: dict[str, pd.DataFrame],
     fake = (strategy_fn(mangled_uni, cfg) if cfg is not None
             else strategy_fn(mangled_uni))
 
+    # Guard BEFORE slicing: an empty BacktestResult carries a RangeIndex,
+    # and comparing that to a Timestamp raises. This is exactly how the
+    # first real-data run crashed - the strategy had nothing to test (no
+    # benchmark in the universe), which must surface as a note, not a
+    # traceback, and must never count as a silent pass.
+    if real.equity.empty or fake.equity.empty:
+        report.notes.append("strategy path: strategy produced no equity curve "
+                            "- NOTHING was tested for this strategy")
+        return report
+
     a = real.equity.loc[real.equity.index <= cut]
     b = fake.equity.loc[fake.equity.index <= cut]
     if a.empty or b.empty:
@@ -409,6 +419,11 @@ def main() -> int:
     from data.alpaca_data import default_stock_universe, fetch_stock_universe_alpaca
 
     tickers = default_stock_universe()[:args.symbols]
+    # The S&P list is alphabetical and SPY is an ETF, never a constituent -
+    # without appending it here, trend_filter and the rotation benchmark
+    # have nothing to run on and the CLI tests less than it claims.
+    if "SPY" not in tickers:
+        tickers.append("SPY")
     lookback = int(args.years * 365) + 500
     logger.info("fetching %d symbols, %d days...", len(tickers), lookback)
     universe = fetch_stock_universe_alpaca(lookback_days=lookback, tickers=tickers)
