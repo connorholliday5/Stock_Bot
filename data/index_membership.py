@@ -41,6 +41,13 @@ delisted years ago, so those bars simply do not exist and cannot be traded
 in replay. Expect results to move toward reality without reaching it, and
 expect a residual gap versus MTUM. That gap stays a documented caveat - not
 evidence that the strategy is good and the ETF is wrong.
+
+One more wrinkle: tickers get reused across decades. Stripping the suffix
+maps `AAL-199702` (Alexander & Alexander, delisted 1997) onto the same
+symbol as today's AAL (American Airlines). Harmless while price data only
+covers recent years - recent dates draw on recent snapshots - but a future
+data source with deep history would need the delisting month respected,
+not just stripped.
 """
 
 from __future__ import annotations
@@ -107,7 +114,14 @@ class Membership:
         """
         if not self.dates:
             return frozenset()
-        ts = pd.Timestamp(date).normalize()
+        ts = pd.Timestamp(date)
+        # Alpaca frames are tz-aware UTC; the snapshot dates are naive.
+        # Comparing the two raises, so strip the tz here - a calendar date
+        # is a calendar date. Without this, every real-data backtest with
+        # the filter on dies (or worse, gets silently swallowed upstream).
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert(None)
+        ts = ts.normalize()
         i = bisect_right(self.dates, ts) - 1
         return self.sets[max(i, 0)]
 

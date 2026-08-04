@@ -73,6 +73,43 @@ def test_trade_objects_are_preferred_over_days_when_available():
     assert out["total_return_pct"] < (res.equity.iloc[-1] / res.equity.iloc[0] - 1) * 100
 
 
+def test_removing_trades_from_a_losing_book_never_flatters():
+    """With fewer winners than n, slicing the sorted list would scoop up
+    LOSERS - and removing a loser raises the adjusted result, flipping a
+    concentration FAIL into a PASS. Only profitable trades may be removed."""
+    eq = pd.Series(10_000 * np.linspace(1.0, 0.95, 100),      # losing book
+                   index=pd.bdate_range("2022-01-03", periods=100))
+    res = BacktestResult(equity=eq, trades=[FakeTrade(50.0), FakeTrade(-200.0),
+                                            FakeTrade(-350.0)],
+                         benchmark=pd.Series(dtype=float), metrics={})
+    out, label = drop_best_trades(res, n=5)
+    base = (eq.iloc[-1] / eq.iloc[0] - 1) * 100
+    assert out["total_return_pct"] <= base, "stress must never improve the result"
+    assert "1 best trades removed" in label or "trades removed" in label
+
+
+def test_all_losing_trades_is_a_reported_noop():
+    eq = pd.Series(10_000 * np.linspace(1.0, 0.9, 100),
+                   index=pd.bdate_range("2022-01-03", periods=100))
+    res = BacktestResult(equity=eq, trades=[FakeTrade(-10.0), FakeTrade(-20.0)],
+                         benchmark=pd.Series(dtype=float), metrics={})
+    out, label = drop_best_trades(res, n=5)
+    assert out == {} and "no profitable trades" in label
+
+
+def test_days_fallback_never_removes_negative_days():
+    idx = pd.bdate_range("2022-01-03", periods=100)
+    rets = np.full(100, -0.001)
+    rets[5] = 0.02                       # exactly one positive day
+    eq = pd.Series(10_000 * np.cumprod(1 + rets), index=idx)
+    res = BacktestResult(equity=eq, trades=[], benchmark=pd.Series(dtype=float),
+                         metrics={})
+    out, label = drop_best_trades(res, n=5)
+    assert "1 best DAYS removed" in label     # not 5: only one was positive
+    base = (eq.iloc[-1] / eq.iloc[0] - 1) * 100
+    assert out["total_return_pct"] <= base
+
+
 def test_wiping_out_the_account_is_reported_not_crashed():
     eq = pd.Series(10_000 * np.linspace(1.0, 1.05, 100),
                    index=pd.bdate_range("2022-01-03", periods=100))

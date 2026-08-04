@@ -209,6 +209,14 @@ def check_scores(raw_universe: dict[str, pd.DataFrame], n_dates: int = 6,
             continue
         if a is None or b is None or a.empty or b.empty:
             continue
+        # `ranked` carries a RangeIndex with the ticker in a column, so
+        # index-based comparison would match rank POSITIONS, not names -
+        # a leak that merely reordered tickers would be invisible, and any
+        # reported subject would be a meaningless integer.
+        if "ticker" in a.columns:
+            a = a.set_index("ticker")
+        if "ticker" in b.columns:
+            b = b.set_index("ticker")
         col = "composite" if "composite" in a.columns else a.columns[-1]
         for sym in set(a.index) & set(b.index):
             x, y = _num(a.loc[sym, col]), _num(b.loc[sym, col])
@@ -270,7 +278,7 @@ def check_strategy_path(strategy_fn, universe: dict[str, pd.DataFrame],
                         tolerance: float = 1e-9) -> LeakReport:
     """THE end-to-end test: run the strategy twice, once on real data and
     once with everything after a cut date destroyed. The equity curve up to
-    the cut must be bit-for-bit identical.
+    the cut must match to within floating-point tolerance (1e-9 relative).
 
     This is the strongest check here because it is indifferent to how the
     strategy is written. Indicators, ranking, position sizing, stop

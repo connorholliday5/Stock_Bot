@@ -156,13 +156,11 @@ def main() -> int:
     print(f"{'strategy':<20} {'return':>10} {'CAGR':>9} {'maxDD':>9} "
           f"{'Sharpe':>8} {'DSR':>7} {'trades':>8} {'costs':>10}")
     print("-" * 104)
-    floor = 0.0
     for name, m, res in sorted(rows, key=lambda r: -r[1].get("total_return_pct", 0)):
         dsr_txt = "   n/a"
         try:
             daily = res.equity.pct_change().dropna()
             d = deflated_sharpe_ratio(daily, n_trials=n_trials)
-            floor = d.expected_max_noise or floor
             dsr_txt = f"{d.deflated_sharpe:>6.3f}"
         except Exception:
             pass
@@ -174,8 +172,7 @@ def main() -> int:
     print(f"{'SPY buy & hold':<20} {bench:>9.2f}%   <- the bar every strategy must clear")
     print("=" * 104)
 
-    if not floor:
-        floor = expected_max_sharpe(n_trials, args.years)
+    floor = expected_max_sharpe(n_trials, args.years)
     print(f"DSR = probability the edge is real given N={n_trials} trials "
           f"(source: {source}).")
     print(f"     A zero-edge strategy, best of {n_trials} tries on {args.years:g}y, "

@@ -119,8 +119,9 @@ def test_detector_catches_full_history_normalization(monkeypatch):
     assert any("rsi" in l.subject for l in rep.leaks)
 
 
-def test_detector_catches_a_backfilled_gap(monkeypatch):
-    """bfill() copies a LATER bar backwards. Silent, and completely fatal."""
+def test_detector_catches_a_negative_shift(monkeypatch):
+    """shift(-3) writes a LATER bar into an earlier row - the same mechanism
+    as a backfilled gap, in its most blatant form."""
     import data.fetcher as fetcher
     real = fetcher.add_features
 

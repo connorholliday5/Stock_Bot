@@ -78,6 +78,17 @@ def test_empty_membership_is_a_clean_unknown():
     assert Membership([], []).members_on("2020-01-01") == frozenset()
 
 
+def test_tz_aware_dates_are_accepted():
+    """Alpaca frames are tz-aware UTC; the snapshot dates are naive. This
+    exact mismatch crashed every real-data backtest with the filter on -
+    while 438 tests passed, because every synthetic fixture was naive."""
+    m = _fake()
+    utc = pd.Timestamp("2007-06-30", tz="UTC")
+    assert m.members_on(utc) == m.members_on("2007-06-30") == {"A", "C"}
+    ny = pd.Timestamp("2007-06-30 20:00", tz="America/New_York")
+    assert m.members_on(ny) == {"A", "C"}
+
+
 # --------------------------- the filter contract ---------------------------
 
 def test_filter_keeps_only_members():
@@ -168,11 +179,37 @@ def test_momentum_only_holds_names_that_were_index_members():
 
     res = backtest_momentum(uni, LabConfig(top_n=4))
     assert res.metrics, "PIT filter must not empty a valid universe"
-    # ZZZ* are not S&P members on any date, so they can never be selected.
-    # With the filter off they would be ranked like anything else.
+    assert res.metrics["trades"] > 0, "real members must still be tradeable"
+
+
+@requires_dataset
+def test_lab_momentum_filter_actually_bites():
+    """The engine has this proof; the lab needs its own. A universe of pure
+    non-members with the filter ON must trade NOTHING - anything else means
+    the wiring is decorative. (An earlier version asserted only
+    trades_on <= trades_off, which held with equality even with the filter
+    disconnected.)"""
+    from backtest.lab import LabConfig, backtest_momentum
+    uni = {f"ZZZ{c}": _frame(50 + i) for i, c in enumerate("ABCDEFGH")}
+    uni["SPY"] = _frame(99)
+
+    on = backtest_momentum(uni, LabConfig(top_n=4))
     off = backtest_momentum(uni, LabConfig(top_n=4, point_in_time_membership=False))
-    assert off.metrics
-    assert res.metrics["trades"] <= off.metrics["trades"]
+    assert on.metrics.get("trades", 0) == 0
+    assert off.metrics.get("trades", 0) > 0
+
+
+@requires_dataset
+def test_lab_momentum_accepts_tz_aware_frames():
+    """The blocker reproduced end-to-end: real Alpaca frames carry a UTC
+    index, and the momentum path must survive that with the filter on -
+    not crash, and not get silently swallowed by a caller's try/except."""
+    from backtest.lab import LabConfig, backtest_momentum
+    uni = {s: _frame(i).tz_localize("UTC")
+           for i, s in enumerate(["AAPL", "MSFT", "JNJ", "XOM", "KO", "PG"])}
+    uni["SPY"] = _frame(99).tz_localize("UTC")
+    res = backtest_momentum(uni, LabConfig(top_n=3))
+    assert res.metrics and res.metrics["trades"] > 0
 
 
 @requires_dataset

@@ -111,7 +111,13 @@ def drop_best_trades(result, n: int = 5) -> tuple[dict, str]:
     trades = [t for t in (getattr(result, "trades", None) or [])
               if getattr(t, "exit_price", None) is not None]
     if trades:
-        winners = sorted(trades, key=lambda t: -float(getattr(t, "pnl", 0.0)))[:n]
+        # Only remove PROFITABLE trades. With fewer than n winners, slicing
+        # the sorted list would scoop up losers - and removing a loser
+        # RAISES the adjusted result, turning a stress test into flattery.
+        winners = sorted((t for t in trades if float(getattr(t, "pnl", 0.0)) > 0),
+                         key=lambda t: -float(getattr(t, "pnl", 0.0)))[:n]
+        if not winners:
+            return {}, "no profitable trades to remove"
         removed = sum(float(getattr(t, "pnl", 0.0)) for t in winners)
         start, end = float(eq.iloc[0]), float(eq.iloc[-1])
         adjusted = end - removed
@@ -129,8 +135,13 @@ def drop_best_trades(result, n: int = 5) -> tuple[dict, str]:
     rets = eq.pct_change().dropna()
     if len(rets) <= n:
         return {}, "not enough return history"
-    keep = rets.drop(rets.nlargest(n).index)
-    return _annualized(_recompound(keep, float(eq.iloc[0]))), f"{n} best DAYS removed"
+    # same guard as above: only positive days, or removal becomes flattery
+    best = rets[rets > 0].nlargest(n)
+    if best.empty:
+        return {}, "no positive days to remove"
+    keep = rets.drop(best.index)
+    return (_annualized(_recompound(keep, float(eq.iloc[0]))),
+            f"{len(best)} best DAYS removed")
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +391,10 @@ def main() -> int:
         return 1
     print_report(rep)
 
-    gates = [rep.survives_2x_costs(), rep.all_plateaus(), rep.survives_trade_removal()]
+    # every gate the report PRINTS participates in the exit code - a gate
+    # that displays but cannot fail the run is decoration, not a gate
+    gates = [rep.survives_2x_costs(), rep.all_plateaus(),
+             rep.survives_trade_removal(), rep.survives_year_removal()]
     return 0 if all(g is not False for g in gates) else 1
 
 
