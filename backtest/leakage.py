@@ -406,6 +406,39 @@ def run_all(raw_universe: dict[str, pd.DataFrame], feature_symbols: int = 6,
     return report
 
 
+def run_all_crypto(raw_universe: dict[str, pd.DataFrame], feature_symbols: int = 4,
+                   n_dates: int = 6) -> LeakReport:
+    """The crypto equivalent of run_all.
+
+    Two deliberate differences from the equity path:
+
+    - check_scores is skipped. It is hard-wired to strategies.stock_scorer,
+      which crypto never calls; running it here would report on code the
+      crypto bot does not execute.
+    - The strategies take RAW OHLCV, not featured frames. The crypto
+      strategies slice history and compute their own indicators per bar, so
+      handing them pre-featured frames would test a path that does not exist.
+    """
+    report = LeakReport()
+    symbols = sorted(s for s, d in raw_universe.items() if d is not None and len(d))
+
+    for sym in symbols[:feature_symbols]:
+        report.extend(check_features(raw_universe[sym], sym, n_dates=n_dates))
+
+    from backtest.crypto_lab import (
+        CryptoLabConfig, backtest_crypto_momentum, backtest_regime,
+    )
+
+    cfg = CryptoLabConfig()
+    for name, fn in (("regime", backtest_regime),
+                     ("crypto_momentum", backtest_crypto_momentum)):
+        sub = check_strategy_path(fn, raw_universe, cfg)
+        for leak in sub.leaks:
+            leak.subject = f"{name}.{leak.subject}"
+        report.extend(sub)
+    return report
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Empirical look-ahead detection")
     ap.add_argument("--years", type=float, default=3.0)
@@ -413,9 +446,17 @@ def main() -> int:
                     help="universe size to pull (features are O(n^2) to recheck)")
     ap.add_argument("--feature-symbols", type=int, default=6)
     ap.add_argument("--dates", type=int, default=8, help="sample dates per check")
+    ap.add_argument("--crypto", action="store_true",
+                    help="gate the crypto strategies instead of the equity ones")
+    ap.add_argument("--timeframe", type=str, default="4h",
+                    help="crypto bar size (--crypto only)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    if args.crypto:
+        return _main_crypto(args)
+
     from data.alpaca_data import default_stock_universe, fetch_stock_universe_alpaca
 
     tickers = default_stock_universe()[:args.symbols]
@@ -438,6 +479,46 @@ def main() -> int:
              if df is not None and {"open", "high", "low", "close", "volume"} <= set(df.columns)}
 
     report = run_all(ohlcv, feature_symbols=args.feature_symbols, n_dates=args.dates)
+    return _print_report(report, ohlcv)
+
+
+def _main_crypto(args) -> int:
+    from backtest.crypto_compare import WIDE
+    from data.alpaca_data import fetch_crypto_universe_alpaca
+
+    hours = {"1h": 1, "4h": 4, "1d": 24}.get(args.timeframe, 4)
+    bars = int(args.years * 365 * 24 / hours) + 300
+    logger.info("fetching %d %s crypto bars per symbol...", bars, args.timeframe)
+    universe = fetch_crypto_universe_alpaca(symbols=WIDE, timeframe=args.timeframe,
+                                            limit=bars)
+    if not universe:
+        logger.error("no crypto data - check ALPACA_API_KEY / ALPACA_SECRET_KEY")
+        return 1
+
+    cols = {"open", "high", "low", "close", "volume"}
+    ohlcv = {s: df[sorted(cols & set(df.columns))].copy()
+             for s, df in universe.items()
+             if df is not None and cols <= set(df.columns)}
+    if not ohlcv:
+        logger.error("crypto data has no usable OHLCV columns")
+        return 1
+    logger.info("gating %d coins: %s", len(ohlcv), ", ".join(sorted(ohlcv)))
+
+    report = run_all_crypto(ohlcv, feature_symbols=min(args.feature_symbols, len(ohlcv)),
+                            n_dates=args.dates)
+    return _print_report(report, ohlcv)
+
+
+def _print_report(report: LeakReport, ohlcv: dict[str, pd.DataFrame]) -> int:
+    # A report with no checks in it is "clean" only in the sense that nothing
+    # ran. Saying GATE 1 PASSED there would be the worst possible failure
+    # mode for this tool: a green light backed by no evidence.
+    if not report.checks:
+        print()
+        print("=" * 78)
+        print("GATE 1 INCONCLUSIVE: NOTHING was tested - no usable history.")
+        print("=" * 78)
+        return 1
 
     print()
     print("=" * 78)

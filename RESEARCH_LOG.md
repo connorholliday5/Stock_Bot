@@ -51,20 +51,35 @@ or remove.
 | 17 | 2026-07 | stock exit mode: Friday-close vs rank-based rotation | rotation kept |
 | 18 | 2026-08 | momentum 12-1 with point-in-time index membership | +121% / 5y (was +202% biased), Sharpe 0.63, DSR 0.33 vs 0.95 gate. Fails deflation. Stress gates 4/5/6 all pass — robust in shape, level indistinguishable from luck. |
 
-**Current N = 18.**
+| 19 | 2026-08 | crypto: hold BTC (the bar the others must clear) | benchmark, not a candidate — logged because it was fitted against the same window |
+| 20 | 2026-08 | crypto: regime, BTC only | pending first gated run |
+| 21 | 2026-08 | crypto: regime, wide universe (7 coins) | pending first gated run |
+| 22 | 2026-08 | crypto: momentum top-3 | pending first gated run |
+
+**Current N = 22.**
+
+Rows 19-22 are logged **before** their results, on purpose. The crypto
+strategies were written and iterated on months ago against this same history;
+counting them only once they produce a good number is precisely the bias this
+file exists to prevent. Adding them moves the noise floor up for every future
+result, including the equity ones — which is correct, because the trials were
+real whether or not anyone wrote them down.
 
 ## The number that matters
 
-At N=18 on five years of history, the noise floor — the Sharpe a strategy with
-**no edge at all** is expected to produce as the best of 18 tries — is
-**0.83**. Our best result was **0.81**.
+At N=22 on five years of history, the noise floor — the Sharpe a strategy with
+**no edge at all** is expected to produce as the best of 22 tries — is
+**0.87**. Our best result was **0.81**.
 
-Edge above noise: **−0.02**. The winner underperforms luck.
+Edge above noise: **−0.06**. The winner underperforms luck.
 
 (At the N=15 we were using before this log was written honestly, the floor was
 0.79 and the edge looked like +0.02. Counting the ML variants — which were
 tried against the same data and dropped — moved it below zero. That sign flip
-is the entire argument for keeping this file.)
+is the entire argument for keeping this file. Adding the four crypto trials
+pushed it from −0.02 to −0.06: the equity result got worse without a single
+equity number changing, because the trial count is a property of the search,
+not of the strategy.)
 
 That is the finding that stopped strategy work and started the measurement
 work. Nothing here gets funded until the deflated Sharpe clears 0.95 against

@@ -143,6 +143,16 @@ python -m backtest.compare --years 5            # side by side, with deflated Sh
 python -m backtest.stress --strategy momentum   # 2x costs + robustness
 ```
 
+The crypto strategies go through the same two gates:
+
+```bash
+python -m backtest.leakage --crypto --years 2
+python -m backtest.crypto_compare --years 2 --stress
+```
+
+Crypto annualizes on 4h bars over 365 days (2190 periods/year), not 252 —
+using the equity default would inflate every crypto Sharpe by ~2.9×.
+
 - **`leakage`** proves the strategy cannot see the future. It recomputes
   every indicator from truncated data, and re-runs each strategy with all
   bars after a cut date randomized — the equity curve before the cut must
