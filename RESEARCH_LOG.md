@@ -49,7 +49,7 @@ or remove.
 | 15 | 2026-07 | ML: + cross-sectional percentile features (17 total) | rejected by the 0.52 AUC gate |
 | 16 | 2026-07 | ML: purged walk-forward, 4 folds, with embargo | validation method, still no signal |
 | 17 | 2026-07 | stock exit mode: Friday-close vs rank-based rotation | rotation kept |
-| 18 | 2026-08 | momentum 12-1 with point-in-time index membership | pending |
+| 18 | 2026-08 | momentum 12-1 with point-in-time index membership | +121% / 5y (was +202% biased), Sharpe 0.63, DSR 0.33 vs 0.95 gate. Fails deflation. Stress gates 4/5/6 all pass — robust in shape, level indistinguishable from luck. |
 
 **Current N = 18.**
 
