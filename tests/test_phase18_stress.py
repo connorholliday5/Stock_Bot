@@ -233,3 +233,33 @@ def test_full_report_runs_and_grades_every_gate():
     for gate in (rep.survives_2x_costs(), rep.survives_trade_removal(),
                  rep.all_plateaus()):
         assert gate in (True, False, None)
+
+
+# --------------------------- research log / DSR wiring ---------------------------
+
+def test_trial_count_is_read_from_the_research_log():
+    """The deflated Sharpe is only meaningful if N is honest, and N lives in
+    a tracked file rather than a constant someone can quietly lower."""
+    from backtest.compare import RESEARCH_LOG, count_trials
+    n, source = count_trials()
+    assert source == RESEARCH_LOG.name
+    assert n >= 15, "the log should already record our whole search history"
+
+
+def test_missing_research_log_does_not_flatter_the_result():
+    """Falling back to N=1 would assume no search at all - the single most
+    flattering possible assumption, and it would inflate every DSR shown."""
+    from pathlib import Path
+
+    from backtest.compare import count_trials
+    n, source = count_trials(Path("/nonexistent/RESEARCH_LOG.md"), default=20)
+    assert n == 20 and source == "assumed"
+
+
+def test_our_best_result_does_not_clear_its_own_noise_floor():
+    """The finding this whole phase exists because of: Sharpe 0.81, selected
+    as the winner of the logged trials, sits BELOW what luck alone produces."""
+    from backtest.compare import count_trials
+    from backtest.validate import expected_max_sharpe
+    n, _ = count_trials()
+    assert expected_max_sharpe(n, years=5) > 0.81

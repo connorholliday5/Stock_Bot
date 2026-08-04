@@ -9,12 +9,14 @@ dashboard. It runs two strategies side by side from the same pot of money:
   exits by falling out of the ranking, and a tight stop on equity noise
   sells dips into recoveries.
 
-  *Backtested over 5 years: +202% vs SPY +67% (Sharpe 0.81 vs 0.70), holding
-  up through the 2022 bear market and across top-N 5/10/20.* **But** MTUM —
-  the real, tradeable momentum ETF — returned 10.3% CAGR over the same
-  window against this backtest's 24.9%, and that gap is mostly survivorship
-  bias (the universe is today's index membership). Expect low-to-mid teens
-  live, not the headline.
+  **Do not trust the headline backtest.** It reported +202% over 5 years
+  (Sharpe 0.81 vs SPY's 0.70), but that number was selected as the best of
+  18 logged trials, and the best of 18 zero-edge strategies scores Sharpe
+  **0.83** on five years by luck alone — so the winner does not clear its
+  own noise floor. MTUM, the real tradeable momentum ETF, returned 10.3%
+  CAGR against this backtest's 24.9%. See `RESEARCH_LOG.md` and the
+  validation gates below. The strategy is running on paper for engineering
+  reasons, not because it is known to work.
 
   The legacy **weekly rotation** (`STOCK_STRATEGY=rotation`) is kept for
   comparison only: it backtested **−1.6% over 3.3 years against SPY +79%**.
@@ -123,10 +125,43 @@ scheduler calls, so it tests the strategy you actually run. Decisions on bar
 T use data through T only and execute at T+1's open; entry/exit costs, the
 stop (with gap-down fills) and the no-margin cash constraint are modeled.
 
-Two honest caveats: the ticker list is *today's* index membership, so
-delisted names are missing (survivorship bias — absolute returns are
-optimistic), and only OHLC is known intrabar, so a bar touching both stop
-and target resolves stop-first.
+Candidates are filtered to **point-in-time index membership**
+(`data/index_membership.py`, 1996–2026), so the engine cannot rank a company
+before it joined the S&P 500. That is a *partial* survivorship correction:
+Alpaca has no bars for names delisted years ago, so the losers still cannot
+be traded in replay and absolute returns remain optimistic. Only OHLC is
+known intrabar, so a bar touching both stop and target resolves stop-first.
+
+### Validating a result
+
+A backtest number on its own means nothing. Three tools decide whether one
+is worth acting on:
+
+```bash
+python -m backtest.leakage --years 3            # look-ahead detection
+python -m backtest.compare --years 5            # side by side, with deflated Sharpe
+python -m backtest.stress --strategy momentum   # 2x costs + robustness
+```
+
+- **`leakage`** proves the strategy cannot see the future. It recomputes
+  every indicator from truncated data, and re-runs each strategy with all
+  bars after a cut date randomized — the equity curve before the cut must
+  not move. Four tests plant a deliberate leak to prove the detector works.
+- **`compare`** reports a **deflated Sharpe** next to the raw one, priced
+  against the trial count in `RESEARCH_LOG.md`. Raw Sharpe is meaningless
+  without N: the more variants you try, the higher a score luck alone
+  produces. DSR ≥ 0.95 is the gate.
+- **`stress`** re-runs at 1×/2×/3× modeled costs, removes the best trades
+  and the best calendar year, and sweeps each parameter ±25% to check the
+  surface is a plateau rather than a spike. Exits non-zero when a gate fails.
+
+**Gates before any real money** — all must pass, in order: zero leaks →
+DSR ≥ 0.95 → permutation test p < 0.05 → survives 2× costs → parameter
+plateau → survives removing the top 5 trades → bootstrapped 95th-percentile
+drawdown written down in advance → 1–3 months of paper trading judged on
+tracking error vs a shadow backtest, **not** on P&L. (`t = Sharpe × √years`
+means confirming a Sharpe-0.5 edge from returns alone takes 16 years — paper
+trading tests the engineering, not the edge.)
 
 ## Keeping it running (Windows)
 
