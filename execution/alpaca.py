@@ -38,6 +38,38 @@ DEFAULT_FEE_RATE = 0.0            # Alpaca US equities are commission-free
 DEFAULT_SLIPPAGE = 0.0005         # 5 bps modeled slippage on paper fills
 MIN_POSITION_USD = 50.0
 
+FILL_POLL_ATTEMPTS = 12
+FILL_POLL_INTERVAL_S = 0.5
+
+
+def await_order_fill(client, order, attempts: int = FILL_POLL_ATTEMPTS,
+                     interval_s: float = FILL_POLL_INTERVAL_S):
+    """Poll an Alpaca order until it reports a fill.
+
+    submit_order returns immediately with status 'accepted'/'new' and
+    filled_qty=0; trusting that snapshot recorded qty-0 positions. Market
+    orders during trading hours fill in well under the ~6s polled here. If the
+    order still isn't filled (e.g. submitted after hours, queued to next
+    open), the caller falls back to the submitted qty at the reference price.
+    """
+    import time
+
+    order_id = getattr(order, "id", None)
+    if order_id is None or client is None:
+        return order
+    for _ in range(attempts):
+        filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+        status = str(getattr(order, "status", "")).lower()
+        if filled_qty > 0 and ("filled" in status or "partially" in status):
+            return order
+        time.sleep(interval_s)
+        try:
+            order = client.get_order_by_id(order_id)
+        except Exception as exc:
+            logger.warning("await_order_fill: get_order_by_id failed: %s", exc)
+            return order
+    return order
+
 
 class StockExecutor:
     """Places (or simulates) Alpaca equity market orders and records them in the DB."""
@@ -60,29 +92,37 @@ class StockExecutor:
             max_positions if max_positions is not None
             else int(getattr(settings, "max_stock_positions", 8))
         )
+        # Backstop floor; the scheduler tightens this per-cycle from account
+        # equity via risk.manager.effective_min_position.
+        self.min_position_usd = float(
+            getattr(settings, "min_position_size", MIN_POSITION_USD))
 
     # -- client bootstrap (live only) --------------------------------------
 
     @classmethod
     def from_settings(cls, paper: Optional[bool] = None) -> "StockExecutor":
         """
-        Build a StockExecutor from config. In live mode this constructs an Alpaca
-        TradingClient; in paper mode no SDK is required.
+        Build a StockExecutor from config, honoring settings.execution_mode:
+        "sim" simulates fills locally (no SDK needed); "paper" routes real
+        orders to the Alpaca paper API; "live" routes to the live API.
         """
-        is_paper = settings.is_paper if paper is None else paper
+        if paper is None:
+            is_sim = settings.execution_mode == "sim"
+        else:
+            is_sim = paper
         client = None
-        if not is_paper:
+        if not is_sim:
             try:
                 from alpaca.trading.client import TradingClient  # type: ignore
                 client = TradingClient(
                     settings.alpaca_api_key,
                     settings.alpaca_secret_key,
-                    paper=False,
+                    paper=settings.alpaca_paper,
                 )
             except Exception as exc:
-                logger.error("Alpaca client init failed, falling back to paper: %s", exc)
-                is_paper = True
-        return cls(paper=is_paper, client=client)
+                logger.error("Alpaca client init failed, falling back to sim: %s", exc)
+                is_sim = True
+        return cls(paper=is_sim, client=client)
 
     # -- balances / state ---------------------------------------------------
 
@@ -146,8 +186,17 @@ class StockExecutor:
             logger.error("submit_order failed for %s %s: %s", side, symbol, exc)
             return {"price": 0.0, "units": 0.0, "fee": 0.0, "status": "rejected"}
 
+        order = await_order_fill(self.client, order)
         price = float(getattr(order, "filled_avg_price", None) or ref_price)
-        filled = float(getattr(order, "filled_qty", None) or units)
+        filled = float(getattr(order, "filled_qty", 0) or 0)
+        if filled <= 0:
+            # Not filled within the poll window (e.g. after-hours queue). The
+            # order is live at the broker; record the submitted size at the
+            # reference price rather than a qty-0 phantom.
+            logger.warning("order %s %s not filled within poll window; recording submitted qty",
+                           side, symbol)
+            filled = units
+            price = ref_price
         fee = price * filled * self.fee_rate
         return {"price": price, "units": filled, "fee": fee, "status": "filled"}
 
@@ -164,8 +213,8 @@ class StockExecutor:
     ) -> dict:
         """Open a long equity position. Enforces max-position and min-notional backstops."""
         notional = units * entry_price
-        if notional < MIN_POSITION_USD:
-            logger.warning("open_long %s rejected: notional $%.2f < min $%.2f", symbol, notional, MIN_POSITION_USD)
+        if notional < self.min_position_usd:
+            logger.warning("open_long %s rejected: notional $%.2f < min $%.2f", symbol, notional, self.min_position_usd)
             return {"status": "rejected", "reason": "below_min_notional", "symbol": symbol}
 
         with get_db() as db:

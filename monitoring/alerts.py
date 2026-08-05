@@ -4,30 +4,38 @@
 # ============================================================
 
 import asyncio
-from telegram import Bot
-from telegram.error import TelegramError
 from loguru import logger
 from config import settings
+
+# Telegram is OPTIONAL in production: the bot must run (and alert to logs)
+# with no token and even with python-telegram-bot not installed. The SDK is
+# therefore imported lazily inside _get_bot(), never at module import.
 
 
 class AlertManager:
 
     def __init__(self):
-        self.bot = Bot(token=settings.telegram_bot_token)
+        self.bot = None
         self.chat_id = settings.telegram_chat_id
         self.enabled = bool(settings.telegram_bot_token and settings.telegram_chat_id)
 
+    def _get_bot(self):
+        if self.bot is None:
+            from telegram import Bot
+            self.bot = Bot(token=settings.telegram_bot_token)
+        return self.bot
+
     async def _send(self, message: str):
         if not self.enabled:
-            logger.warning("Telegram not configured — alert not sent")
+            logger.info("Telegram not configured — alert logged only:\n{}", message)
             return
         try:
-            await self.bot.send_message(
+            await self._get_bot().send_message(
                 chat_id=self.chat_id,
                 text=message,
                 parse_mode="Markdown"
             )
-        except TelegramError as e:
+        except Exception as e:
             logger.error(f"Telegram alert failed: {e}")
 
     def send(self, message: str):

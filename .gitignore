@@ -1,6 +1,10 @@
 # Secrets
 .env
 *.env
+!.env.example
+
+# Local data (SQLite fallback DB)
+data_store/
 
 # Python
 __pycache__/

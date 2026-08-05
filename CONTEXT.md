@@ -1,4 +1,41 @@
-﻿# CONTEXT - Phase 4 (Crypto 24/7 Strategy)
+﻿# CONTEXT - Production release (web UI + broker capital)
+
+## Status: PRODUCTION WIRING COMPLETE
+
+What shipped on top of the Phase 8 baseline:
+
+- **Broker capital**: `execution/account.py` reads live Alpaca equity/cash
+  (TTL-cached 60s). `CAPITAL_SOURCE=broker` (default) makes the money in the
+  Alpaca account the capital base; `static` restores the old behavior.
+- **Crypto through Alpaca**: `execution/alpaca_crypto.py` routes 24/7 crypto
+  orders (BTC/USD, GTC) through the same account. `CRYPTO_EXCHANGE=binance`
+  keeps the ccxt path. Crypto data comes from Alpaca's keyless endpoint.
+- **Alpaca stock data fallback**: `data/alpaca_data.py` (IEX daily bars,
+  ~55-name seed universe) so the bot runs with only Alpaca keys; a Polygon
+  key upgrades to the full S&P 500 scan.
+- **Scheduler rewired** to the real strategy interfaces. Bugs fixed:
+  `rm.is_halted` used as attribute (always truthy - blocked ALL entries),
+  wrong kwargs (`funding=`/`cash=`), symbol lists passed where DataFrame
+  dicts expected, ORM rows passed where dicts expected, `close_long()`
+  called without an exit price, missing `universe` on Friday sells. Jobs now
+  execute returned entry/exit plans and refresh position marks.
+- **Web UI**: FastAPI + self-contained dashboard (`webapp/`), served by
+  `main.py` alongside the scheduler. Pause/resume (entries only - exits and
+  stops keep running), manual job triggers, equity curve, positions/trades/
+  signals, job schedule. Optional `WEB_AUTH_TOKEN` guards control endpoints.
+- **Execution ladder**: sim (default) -> paper API -> live via
+  `ENVIRONMENT` + `ALPACA_PAPER` (`settings.execution_mode`).
+- **Config hardening**: only Alpaca keys required; SQLite fallback when no
+  Postgres; Telegram optional (lazy import). `main_1.py` deleted (called a
+  nonexistent `start_scheduler`); `main.py` is the entry point.
+- Tests: `test_phase6.py` rewritten for the corrected contracts,
+  `test_phase9_production.py` added (account layer, crypto executor, web API).
+
+Historical phase notes follow.
+
+---
+
+# CONTEXT - Phase 4 (Crypto 24/7 Strategy)
 
 Append this section to your existing CONTEXT.md.
 

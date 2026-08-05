@@ -81,6 +81,22 @@ MIN_BARS_24H = 210              # need a valid EMA200 (200) plus headroom
 MIN_POSITION_USD = 50.0
 
 BTC_SYMBOL = "BTC/USDT"
+BTC_BASE = "BTC"
+
+
+def _base_asset(symbol: str) -> str:
+    """'BTC/USDT' -> 'BTC', 'BTC/USD' -> 'BTC', 'BTCUSD' -> 'BTCUSD'.
+
+    The btc_only gate must work whichever venue supplies the universe:
+    Binance quotes in USDT, Alpaca in USD. Comparing whole symbols against a
+    hardcoded 'BTC/USDT' silently rejected EVERY Alpaca symbol (including
+    BTC/USD), so no crypto entry could ever be generated.
+    """
+    return (symbol or "").split("/", 1)[0].upper()
+
+
+def is_btc(symbol: str) -> bool:
+    return _base_asset(symbol) == BTC_BASE
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +115,9 @@ class SizingResult:
 
     @property
     def tradable(self) -> bool:
-        return self.units > 0 and self.notional >= MIN_POSITION_USD
+        # The sizing engine enforces the (equity-adaptive) minimum-position
+        # floor and zeroes units when breached, so units > 0 is the contract.
+        return self.units > 0 and self.notional > 0
 
 
 @dataclass
@@ -130,6 +148,21 @@ class CryptoCycleResult:
     entries: list[CryptoEntryPlan] = field(default_factory=list)
     exits: list[CryptoExitPlan] = field(default_factory=list)
     persisted: int = 0
+    # symbol -> the gate that blocked it this cycle ("ok" when it passed).
+    # Without this, a cycle that opens nothing is indistinguishable from a
+    # cycle that COULD NOT open anything - which is exactly how a symbol-
+    # matching bug hid for two weeks behind a truthful-looking "opened=0".
+    gate_reasons: dict = field(default_factory=dict)
+
+    def gate_summary(self) -> str:
+        """Compact 'why nothing traded' line, most common reason first."""
+        if not self.gate_reasons:
+            return ""
+        counts: dict[str, int] = {}
+        for reason in self.gate_reasons.values():
+            counts[reason] = counts.get(reason, 0) + 1
+        parts = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        return " ".join(f"{reason}={n}" for reason, n in parts)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +230,24 @@ def bullish_ema_cross(df: pd.DataFrame, lookback: int = EMA_CROSS_LOOKBACK) -> b
     return bool(crossed)
 
 
+def ema_stacked_bullish(df: pd.DataFrame) -> bool:
+    """True while EMA9 sits above EMA21 on the last bar - the POSTURE test.
+
+    Unlike bullish_ema_cross this does not demand the crossing moment
+    happened within the last few bars, so a bot starting (or re-entering)
+    mid-trend still participates. Used by CRYPTO_ENTRY_MODE=regime.
+    """
+    if df is None or df.empty:
+        return False
+    if "ema_9" not in df.columns or "ema_21" not in df.columns:
+        return False
+    ema9 = df["ema_9"].iloc[-1]
+    ema21 = df["ema_21"].iloc[-1]
+    if pd.isna(ema9) or pd.isna(ema21):
+        return False
+    return bool(ema9 > ema21)
+
+
 def bearish_ema_cross(df: pd.DataFrame) -> bool:
     """True if EMA9 is at or below EMA21 on the last bar (trend turned down)."""
     if df is None or df.empty:
@@ -208,6 +259,20 @@ def bearish_ema_cross(df: pd.DataFrame) -> bool:
     if pd.isna(ema9) or pd.isna(ema21):
         return False
     return bool(ema9 <= ema21)
+
+
+def macd_positive(df: pd.DataFrame) -> bool:
+    """True while MACD sits in positive territory - the POSTURE confirmation.
+
+    macd_confirms_long (macd > signal AND hist > 0) demands *accelerating*
+    momentum; in a steady established trend MACD hugs its signal line and the
+    histogram oscillates around zero, so that test flaps. A posture entry
+    only needs the trend to be up, which positive MACD expresses.
+    """
+    if df is None or df.empty or "macd" not in df.columns:
+        return False
+    macd = df["macd"].iloc[-1]
+    return bool(pd.notna(macd) and macd > 0)
 
 
 def macd_confirms_long(df: pd.DataFrame) -> bool:
@@ -390,8 +455,22 @@ def generate_24h_entries(
     win_rate: float = DEFAULT_WIN_RATE,
     win_loss_ratio: float = DEFAULT_WIN_LOSS_RATIO,
     risk_manager: Optional[RiskManager] = None,
+    entry_mode: str = "cross",
+    gate_log: Optional[dict] = None,
 ) -> list[CryptoEntryPlan]:
-    """Evaluate every symbol and return sizeable, gated long entry plans."""
+    """Evaluate every symbol and return sizeable, gated long entry plans.
+
+    Pass a dict as `gate_log` to record, per symbol, which gate rejected it
+    ("ok" when an entry plan was produced) - the observability that makes a
+    zero-entry cycle explainable instead of mysterious.
+
+    entry_mode:
+      "cross"  - legacy: requires a FRESH EMA9/21 cross within 3 bars plus a
+                 1.5x volume spike. Precise but misses trends already running.
+      "regime" - posture: long while the trend is intact (EMA9>EMA21, price
+                 above EMA200, ADX trending, MACD positive). Enters mid-trend;
+                 volume gate relaxed to average.
+    """
     held = {_position_symbol(p) for p in open_positions}
     open_count = len(held)
     plans: list[CryptoEntryPlan] = []
@@ -406,31 +485,52 @@ def generate_24h_entries(
     if risk_manager is not None:
         current_heat = risk_manager.portfolio_heat(AssetType.CRYPTO, equity=equity)
 
+    def _blocked(symbol: str, reason: str) -> None:
+        if gate_log is not None:
+            gate_log[symbol] = reason
+        logger.debug("%s: entry blocked by %s", symbol, reason)
+
     for symbol, df in universe.items():
         if open_count + len(plans) >= max_positions:
             logger.info("Max crypto positions reached (%d) - no more entries", max_positions)
             break
         if symbol in held:
+            _blocked(symbol, "already_held")
             continue
-        if btc_only and symbol != BTC_SYMBOL:
-            logger.debug("btc_only gate: skipping %s", symbol)
+        if btc_only and not is_btc(symbol):
+            _blocked(symbol, "btc_only")
             continue
         if df is None or len(df) < MIN_BARS_24H:
-            logger.debug("%s: insufficient bars for 24h entry", symbol)
+            _blocked(symbol, "insufficient_bars")
             continue
 
         if not above_ema200(df):
+            _blocked(symbol, "below_ema200")
             continue
         regime = classify_regime(df)
         if regime != MarketRegime.TRENDING:
-            logger.debug("%s: regime %s not tradable for trend entry", symbol, regime.value)
+            _blocked(symbol, f"regime_{regime.value}")
             continue
-        if not bullish_ema_cross(df):
-            continue
-        if not macd_confirms_long(df):
-            continue
-        if _last_float(df, "volume_ratio", 0.0) < VOLUME_SPIKE_MIN:
-            continue
+        if entry_mode == "regime":
+            if not ema_stacked_bullish(df):
+                _blocked(symbol, "ema_not_stacked")
+                continue
+            if not macd_positive(df):
+                _blocked(symbol, "macd_not_positive")
+                continue
+            if _last_float(df, "volume_ratio", 0.0) < 1.0:
+                _blocked(symbol, "volume_below_avg")
+                continue
+        else:
+            if not bullish_ema_cross(df):
+                _blocked(symbol, "no_fresh_ema_cross")
+                continue
+            if not macd_confirms_long(df):
+                _blocked(symbol, "macd_unconfirmed")
+                continue
+            if _last_float(df, "volume_ratio", 0.0) < VOLUME_SPIKE_MIN:
+                _blocked(symbol, "no_volume_spike")
+                continue
 
         entry_price = _last_float(df, "close")
         atr = _last_float(df, "atr")
@@ -448,8 +548,11 @@ def generate_24h_entries(
         )
         if not sizing.tradable:
             logger.info("%s: entry gated by sizing (%s)", symbol, sizing.reason)
+            _blocked(symbol, f"sizing_{sizing.reason}")
             continue
 
+        if gate_log is not None:
+            gate_log[symbol] = "ok"
         plans.append(CryptoEntryPlan(
             symbol=symbol,
             entry_price=entry_price,
@@ -476,8 +579,15 @@ def generate_24h_exits(
     open_positions: list[dict],
     universe: dict[str, pd.DataFrame],
     atr_stop_mult: float = ATR_STOP_MULT,
+    entry_mode: str = "cross",
 ) -> list[CryptoExitPlan]:
-    """Return exit plans for held positions whose trend has broken down."""
+    """Return exit plans for held positions whose trend has broken down.
+
+    In "regime" mode the MACD-histogram-negative exit is dropped: a posture
+    position rides the trend until the trend itself breaks (EMA structure or
+    stop); a single negative MACD bar mid-uptrend is noise, and exiting on it
+    pays the 0.5% round-trip fee for nothing.
+    """
     plans: list[CryptoExitPlan] = []
 
     for pos in open_positions:
@@ -500,7 +610,8 @@ def generate_24h_exits(
             reason = "below_ema200"
         elif bearish_ema_cross(df):
             reason = "ema_bearish_cross"
-        elif "macd_hist" in df.columns and pd.notna(df["macd_hist"].iloc[-1]) and df["macd_hist"].iloc[-1] < 0:
+        elif (entry_mode != "regime" and "macd_hist" in df.columns
+              and pd.notna(df["macd_hist"].iloc[-1]) and df["macd_hist"].iloc[-1] < 0):
             reason = "macd_hist_negative"
         else:
             # ATR trailing stop: prefer the stored stop_loss, else derive from entry.
@@ -533,6 +644,7 @@ def run_crypto_24h_pipeline(
     win_rate: float = DEFAULT_WIN_RATE,
     win_loss_ratio: float = DEFAULT_WIN_LOSS_RATIO,
     risk_manager: Optional[RiskManager] = None,
+    entry_mode: str = "cross",
 ) -> CryptoCycleResult:
     """
     Full 24/7 crypto decision cycle. Exits are evaluated first (free up slots),
@@ -541,15 +653,18 @@ def run_crypto_24h_pipeline(
 
     Pass a RiskManager to enforce the monthly drawdown halt and shared portfolio
     heat; omit it (default) for the Phase 4 standalone behavior.
+    entry_mode: "cross" (legacy fresh-cross gate) or "regime" (trend posture).
     """
     funding_rates = funding_rates or {}
     open_positions = open_positions or []
 
-    exits = generate_24h_exits(open_positions, universe)
+    exits = generate_24h_exits(open_positions, universe, entry_mode=entry_mode)
     exiting_symbols = {e.symbol for e in exits}
     remaining_positions = [p for p in open_positions if _position_symbol(p) not in exiting_symbols]
 
+    gate_log: dict = {}
     entries = generate_24h_entries(
+        gate_log=gate_log,
         universe=universe,
         funding_rates=funding_rates,
         open_positions=remaining_positions,
@@ -559,6 +674,7 @@ def run_crypto_24h_pipeline(
         win_rate=win_rate,
         win_loss_ratio=win_loss_ratio,
         risk_manager=risk_manager,
+        entry_mode=entry_mode,
     )
 
     persisted = 0
@@ -566,4 +682,5 @@ def run_crypto_24h_pipeline(
         events = [e.signal for e in exits] + [p.signal for p in entries]
         persisted = persist_signals(events)
 
-    return CryptoCycleResult(entries=entries, exits=exits, persisted=persisted)
+    return CryptoCycleResult(entries=entries, exits=exits, persisted=persisted,
+                             gate_reasons=gate_log)

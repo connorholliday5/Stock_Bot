@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -44,6 +45,65 @@ DEFAULT_PARAMS: dict = {
     "random_state": 42,
 }
 
+# --- GPU acceleration -------------------------------------------------------
+# The retrain now pools ~3 years x ~500 tickers and (with walk-forward) fits
+# several models per run. On a CUDA box that is minutes of CPU time or
+# seconds of GPU time, which is what makes multi-fold validation practical.
+# Detection is a real tiny fit, cached: capability probes lie less than
+# version strings, and any failure silently falls back to CPU.
+_GPU_STATE: Optional[bool] = None
+
+
+def gpu_available() -> bool:
+    """True when XGBoost can actually train on CUDA here. Cached."""
+    global _GPU_STATE
+    if _GPU_STATE is not None:
+        return _GPU_STATE
+    if not _HAS_XGB:
+        _GPU_STATE = False
+        return False
+    if str(os.environ.get("ML_FORCE_CPU", "")).lower() in {"1", "true", "yes"}:
+        logger.info("ML_FORCE_CPU set; training on CPU")
+        _GPU_STATE = False
+        return False
+    # XGBoost does NOT raise when CUDA is missing - it emits a C++ level
+    # "Device is changed from GPU to CPU" notice and quietly trains on CPU,
+    # so a probe-fit always "succeeds" and cannot be used for detection.
+    # Ask the driver instead: nvidia-smi exits 0 only with a usable GPU.
+    try:
+        import shutil
+        import subprocess
+
+        if shutil.which("nvidia-smi") is None:
+            _GPU_STATE = False
+            logger.info("No nvidia-smi on PATH; training on CPU")
+            return _GPU_STATE
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        name = (proc.stdout or "").strip().splitlines()
+        if proc.returncode == 0 and name:
+            _GPU_STATE = True
+            logger.info("CUDA device detected ({}); training on GPU", name[0])
+        else:
+            _GPU_STATE = False
+            logger.info("nvidia-smi reported no GPU; training on CPU")
+    except Exception as exc:
+        _GPU_STATE = False
+        logger.info("GPU detection failed (%s); training on CPU", type(exc).__name__)
+    return _GPU_STATE
+
+
+def _apply_device(params: dict) -> dict:
+    """Attach device/tree_method unless the caller pinned them."""
+    if "device" in params:
+        return params
+    if gpu_available():
+        params["device"] = "cuda"
+        params.setdefault("tree_method", "hist")
+    return params
+
 
 def _roc_auc(y_true, scores) -> float:
     """Rank based AUC (Mann Whitney), tie safe. NaN if one class only."""
@@ -68,7 +128,15 @@ class TrainedModel:
         """P(positive) per row, indexed like X. Empty in -> empty out."""
         if X is None or X.empty:
             return pd.Series(dtype="float64", name="ml_prob")
-        Xm = X[self.feature_cols].astype("float64")
+        # A GPU-trained booster predicting on CPU arrays makes XGBoost copy
+        # through a DMatrix ("mismatched devices" warning) - slower and
+        # heavier. Inference is ~500 rows once a week, so pin the booster to
+        # CPU for prediction; training keeps the GPU where it actually pays.
+        try:
+            self.model.get_booster().set_param({"device": "cpu"})
+        except Exception:
+            pass
+        Xm = X[self.feature_cols].astype("float32")
         proba = self.model.predict_proba(Xm.to_numpy())[:, 1]
         return pd.Series(proba, index=X.index, name="ml_prob")
 
@@ -123,8 +191,21 @@ def train_model(
     if pos > 0:
         p.setdefault("scale_pos_weight", max(neg / pos, 1e-3))
 
+    p = _apply_device(p)
     clf = XGBClassifier(**p)
-    clf.fit(X[FEATURE_COLS].astype("float64").to_numpy(), y.to_numpy())
+    try:
+        clf.fit(X[FEATURE_COLS].astype("float32").to_numpy(), y.to_numpy())
+    except Exception as exc:
+        if p.get("device") != "cuda":
+            raise
+        # A GPU that probes fine can still fail on a real matrix (OOM, driver
+        # mismatch). Never let that kill the weekly retrain - drop to CPU.
+        global _GPU_STATE
+        _GPU_STATE = False
+        logger.warning("GPU training failed (%s); retrying on CPU", exc)
+        p.pop("device", None)
+        clf = XGBClassifier(**p)
+        clf.fit(X[FEATURE_COLS].astype("float32").to_numpy(), y.to_numpy())
     return TrainedModel(
         model=clf,
         feature_cols=list(FEATURE_COLS),

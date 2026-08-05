@@ -125,15 +125,34 @@ def test_crypto_half_kelly_delegates_to_engine():
 # ===========================================================================
 
 def test_size_stock_basic():
+    """Default sizing is now capped at 1/max_positions of equity.
+
+    The raw risk math (200 risk / 5 stop = 40 units = 40% of equity) is
+    unchanged, but shipping it uncapped meant cash died after ~2.5 positions
+    and MAX_STOCK_POSITIONS=8 could never happen - the bot silently ran a
+    concentrated 2-3 name book. The cap binds first now.
+    """
     ps = size_position(
         stock_params(), equity=10000, available_cash=10000,
         entry_price=100.0, stop_price=95.0, tp_r_mult=2.0,
     )
     assert ps.tradable
     assert ps.effective_risk_pct == pytest.approx(0.02)
-    assert ps.units == pytest.approx(40.0, abs=1e-6)   # 200 risk / 5 stop
+    assert ps.units == pytest.approx(12.5, rel=1e-3)    # 1/8 of equity, not 40%
+    assert ps.notional <= 10000 * 0.126
     assert ps.stop_price == pytest.approx(95.0)
     assert ps.take_profit == pytest.approx(110.0)
+
+
+def test_size_stock_uncapped_is_still_raw_risk_math():
+    """With the cap disabled the engine returns the pure fixed-fractional
+    size, so the underlying risk model is unchanged - only the default."""
+    ps = size_position(
+        stock_params(max_position_notional_pct=1.0),
+        equity=10000, available_cash=10000,
+        entry_price=100.0, stop_price=95.0, tp_r_mult=2.0,
+    )
+    assert ps.units == pytest.approx(40.0, abs=1e-6)   # 200 risk / 5 stop
 
 
 def test_size_heat_clamp():

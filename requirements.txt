@@ -8,33 +8,28 @@ python-dotenv>=1.0.0
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
 
-# --- Trading APIs ---
-alpaca-py>=0.13.3
-ccxt>=4.2.25
-
-# --- Market Data ---
-polygon-api-client>=1.13.1
+# --- Trading / Market Data (Alpaca is the only required integration) ---
+alpaca-py>=0.20
+ccxt>=4.2.25              # optional Binance crypto path + free public OHLCV
 pandas>=2.2.0
 numpy>=2.0.0
 
-# --- Database ---
-psycopg2-binary>=2.9.9
+# --- Database (SQLite works out of the box; psycopg2 enables Postgres) ---
 sqlalchemy>=2.0.23
+psycopg2-binary>=2.9.9
 
 # --- Scheduling ---
 APScheduler>=3.10.4
 
-# --- ML ---
+# --- Web UI ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# --- ML (weekly stock scorer) ---
 scikit-learn>=1.3.2
 xgboost>=2.0.3
-transformers>=4.36.2
-torch>=2.1.2
 
-# --- Monitoring ---
-streamlit>=1.29.0
-plotly>=5.18.0
-
-# --- Alerts ---
+# --- Alerts (optional at runtime; bot logs alerts if unconfigured) ---
 python-telegram-bot>=20.7
 
 # --- Logging ---
@@ -43,8 +38,8 @@ loguru>=0.7.2
 # --- Testing ---
 pytest>=7.4.3
 pytest-asyncio>=0.23.2
+httpx>=0.27              # FastAPI TestClient
 
 # --- Utilities ---
 requests>=2.31.0
 pytz>=2023.3
-schedule>=1.2.1

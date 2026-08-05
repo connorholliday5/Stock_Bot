@@ -259,6 +259,58 @@ def get_open_positions(asset_type=None):
         db.close()
 
 
+def update_position_marks(prices: dict) -> int:
+    """Refresh Position.current_price (+ unrealized P&L) from {symbol: price}.
+    Returns how many rows were updated. Best-effort: unknown symbols and
+    non-positive prices are skipped."""
+    if not prices:
+        return 0
+    updated = 0
+    try:
+        with get_db() as db:
+            for pos in db.query(Position).all():
+                price = prices.get(pos.symbol)
+                try:
+                    price = float(price) if price is not None else None
+                except (TypeError, ValueError):
+                    price = None
+                if price is None or price <= 0:
+                    continue
+                pos.current_price = price
+                qty = float(pos.quantity or 0.0)
+                entry = float(pos.entry_price or 0.0)
+                pos.unrealized_pnl = (price - entry) * qty
+                pos.unrealized_pnl_pct = (price / entry - 1.0) if entry > 0 else None
+                updated += 1
+    except Exception as exc:
+        logger.warning(f"update_position_marks failed: {exc}")
+    return updated
+
+
+def get_recent_trades(limit: int = 100):
+    """Most recent Trade rows (open and closed), newest first, detached."""
+    db = SessionLocal()
+    try:
+        stmt = select(Trade).order_by(Trade.created_at.desc(), Trade.id.desc()).limit(limit)
+        rows = list(db.scalars(stmt).all())
+        db.expunge_all()
+        return rows
+    finally:
+        db.close()
+
+
+def get_recent_signals(limit: int = 100):
+    """Most recent Signal rows, newest first, detached."""
+    db = SessionLocal()
+    try:
+        stmt = select(Signal).order_by(Signal.created_at.desc(), Signal.id.desc()).limit(limit)
+        rows = list(db.scalars(stmt).all())
+        db.expunge_all()
+        return rows
+    finally:
+        db.close()
+
+
 def get_model_performance():
     """All ModelPerformance rows. Reporting limits/sorts (newest-first, 8).
     Returns a list of detached ModelPerformance rows."""

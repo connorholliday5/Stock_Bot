@@ -1,0 +1,39 @@
+# ============================================================
+# docker-compose.yml
+# Simplest deployment: `docker compose up -d --build`
+#
+# By default the bot uses its built-in SQLite database stored in the
+# ./data_store volume - no other service needed. To use Postgres instead,
+# un-comment the db service and the DB_* environment lines.
+# ============================================================
+
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # SQLite lives in the mounted volume so data survives rebuilds
+      DATA_DIR: /app/data_store
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data_store:/app/data_store
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+      - ./models:/app/models
+    # depends_on:
+    #   - db
+
+  # db:
+  #   image: postgres:16-alpine
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_DB: stockbot
+  #     POSTGRES_USER: stockbot_user
+  #     POSTGRES_PASSWORD: ${DB_PASSWORD}
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+
+# volumes:
+#   pgdata:

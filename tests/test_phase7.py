@@ -10,10 +10,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ml.labels import DEFAULT_FEE_BPS, forward_return, make_labels
+from ml.labels import DEFAULT_FEE_BPS, forward_return, make_labels, relative_labels
 from ml.features import (
     FEATURE_COLS,
     REQUIRED_COLS,
+    XS_FEATURE_COLS,
     build_inference_matrix,
     build_training_matrix,
 )
@@ -92,8 +93,70 @@ def test_make_labels_fee_threshold_and_tail():
 
 
 # ---------------------------------------------------------------------------
+# Relative (cross-sectional) labels
+# ---------------------------------------------------------------------------
+
+def test_relative_label_beats_median_per_date():
+    # Three stocks on one date with forward returns 1%, 2%, 3% -> median 2%.
+    # Only the 3% stock beats the median; the 2% (== median) does not.
+    pooled = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-01"] * 3),
+        "forward_return": [0.01, 0.02, 0.03],
+    })
+    lab = relative_labels(pooled)
+    assert lab.tolist() == [0.0, 0.0, 1.0]
+
+
+def test_relative_label_is_per_date_not_global():
+    # Same 1%/2%/3% pattern repeated on two different dates: the winner is the
+    # top-of-day stock, not the globally-largest return.
+    pooled = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-01"] * 3 + ["2024-01-02"] * 3),
+        "forward_return": [0.01, 0.02, 0.03, 0.10, 0.20, 0.30],
+    })
+    lab = relative_labels(pooled)
+    assert lab.tolist() == [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]
+
+
+def test_relative_label_nan_forward_return_stays_nan():
+    pooled = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-01"] * 3),
+        "forward_return": [0.01, float("nan"), 0.03],
+    })
+    lab = relative_labels(pooled)
+    assert pd.isna(lab.iloc[1])
+
+
+# ---------------------------------------------------------------------------
 # Features
 # ---------------------------------------------------------------------------
+
+def test_cross_sectional_features_present_and_bounded():
+    matrix, _ = build_training_matrix(_make_universe(10), horizon=5)
+    for c in XS_FEATURE_COLS:
+        assert c in matrix.columns
+        assert matrix[c].between(0.0, 1.0).all()   # percentile ranks in [0,1]
+
+
+def test_inference_matches_training_feature_columns():
+    uni = _make_universe(8)
+    train, _ = build_training_matrix(uni, horizon=5)
+    X, _ = build_inference_matrix(uni)
+    # the model trains on train[FEATURE_COLS] and infers on X - identical cols
+    assert list(X.columns) == FEATURE_COLS
+    assert [c for c in train.columns if c in FEATURE_COLS] == FEATURE_COLS
+    xs = X[XS_FEATURE_COLS]
+    assert ((xs >= 0.0) & (xs <= 1.0)).all().all()
+
+
+def test_absolute_label_mode_still_available():
+    uni = _make_universe(6)
+    rel, _ = build_training_matrix(uni, horizon=5, label_mode="relative")
+    ab, _ = build_training_matrix(uni, horizon=5, label_mode="absolute")
+    # both produce binary labels; the two labelings generally differ
+    assert set(rel["label"].unique()).issubset({0, 1})
+    assert set(ab["label"].unique()).issubset({0, 1})
+
 
 def test_training_matrix_columns_and_no_nan():
     uni = _make_universe(6)
@@ -284,6 +347,50 @@ def test_retrain_writer_failure_does_not_kill_job():
         performance_writer=bad_writer,
     )
     assert res.ok  # adapter failure swallowed
+
+
+def test_walk_forward_reports_multiple_folds():
+    """Stability across folds is the real signal; one holdout is one draw."""
+    from ml.retrain import purged_walk_forward
+    matrix, _ = build_training_matrix(_make_universe(16, signal=1.5), horizon=5)
+    matrix = matrix.sort_values("date").reset_index(drop=True)
+    wf = purged_walk_forward(matrix, n_folds=4, embargo=5,
+                             params={"n_estimators": 40})
+    assert wf["n_folds"] >= 2
+    assert len(wf["fold_aucs"]) == wf["n_folds"]
+    assert 0.0 <= wf["auc_mean"] <= 1.0
+    assert wf["auc_std"] >= 0.0
+
+
+def test_walk_forward_short_history_returns_empty():
+    from ml.retrain import purged_walk_forward
+    tiny = pd.DataFrame({"label": [0, 1] * 10})
+    assert purged_walk_forward(tiny)["n_folds"] == 0
+
+
+def test_retrain_includes_walk_forward_metrics():
+    res = run_rolling_retrain(
+        _make_universe(14, signal=1.5), horizon=5,
+        params={"n_estimators": 40}, walk_forward_folds=3,
+    )
+    assert res.ok
+    assert "auc_mean" in res.metrics and "fold_aucs" in res.metrics
+
+
+def test_gpu_detection_is_safe_and_cached():
+    """Must return a bool and never raise, GPU present or not."""
+    from ml.model import gpu_available
+    first = gpu_available()
+    assert isinstance(first, bool)
+    assert gpu_available() is first          # cached
+
+
+def test_training_works_regardless_of_device():
+    matrix, _ = build_training_matrix(_make_universe(8), horizon=5)
+    model = train_model(matrix[FEATURE_COLS], matrix["label"],
+                        params={"n_estimators": 30})
+    probs = model.predict_proba(matrix[FEATURE_COLS].head(10))
+    assert ((probs >= 0.0) & (probs <= 1.0)).all()
 
 
 def test_retrain_insufficient_data():

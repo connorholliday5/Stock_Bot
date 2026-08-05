@@ -64,6 +64,19 @@ CRYPTO_MAX_POSITION_NOTIONAL_PCT = 0.35  # carried over from Phase 4
 MONTHLY_DRAWDOWN_HALT = -0.15      # <= -15% intramonth halts new entries
 
 MIN_POSITION_USD = 50.0
+ABSOLUTE_MIN_POSITION_USD = 10.0   # below this, fees/spread dominate any edge
+
+
+def effective_min_position(equity: float, configured: Optional[float] = None) -> float:
+    """Adaptive position floor: the configured minimum (MIN_POSITION_SIZE),
+    but never more than 10% of equity - so a small account (e.g. $230) can
+    still open ~$23 positions instead of being locked out by the $50 default.
+    Hard floor $10: under that, fees and spread dominate any edge."""
+    if configured is None:
+        configured = float(getattr(settings, "min_position_size", MIN_POSITION_USD))
+    if equity and equity > 0:
+        return max(ABSOLUTE_MIN_POSITION_USD, min(configured, 0.10 * float(equity)))
+    return configured
 
 DEFAULT_WIN_RATE = 0.5             # placeholders until ML phase calibrates from live stats
 DEFAULT_WIN_LOSS_RATIO = 1.5
@@ -116,15 +129,36 @@ class PositionSize:
         return self.units > 0.0 and self.notional > 0.0
 
 
+def stock_position_cap(max_positions: int) -> float:
+    """Per-position notional cap as a fraction of equity.
+
+    STOCK_MAX_POSITION_PCT when set, else auto = 1 / max_positions. The auto
+    default exists because risk-based sizing computes
+        notional = equity * risk_per_trade / stop_distance_pct
+    so the shipped 2% risk with a 5% stop is a FORTY percent position: cash
+    is exhausted after ~2.5 of them and the configured 8-position portfolio
+    never materialises. Capping makes max_positions mean what it says.
+    """
+    configured = float(getattr(settings, "stock_max_position_pct", 0.0) or 0.0)
+    if configured > 0:
+        return min(configured, 1.0)
+    n = max(int(max_positions or 1), 1)
+    return 1.0 / n
+
+
 def stock_params(
     risk_per_trade: float = STOCK_RISK_PER_TRADE,
     max_heat: float = STOCK_MAX_HEAT,
-    max_position_notional_pct: float = STOCK_MAX_POSITION_NOTIONAL_PCT,
+    max_position_notional_pct: Optional[float] = None,
     min_position_usd: Optional[float] = None,
     fee_rate: float = STOCK_FEE_RATE,
     slippage_pct: float = STOCK_SLIPPAGE,
     max_positions: Optional[int] = None,
 ) -> RiskParams:
+    n_positions = (max_positions if max_positions is not None
+                   else int(getattr(settings, "max_stock_positions", 8)))
+    if max_position_notional_pct is None:
+        max_position_notional_pct = stock_position_cap(n_positions)
     return RiskParams(
         asset_type=AssetType.STOCK,
         risk_per_trade=risk_per_trade,
@@ -252,14 +286,20 @@ def size_position(
         notional = max_notional
         units = notional / eff_entry
 
-    # No margin: cannot deploy more than available cash net of fee/slippage buffer.
-    if available_cash > 0:
-        cash_ceiling = available_cash / (1.0 + max(0.0, params.fee_rate))
-        if notional > cash_ceiling:
-            notional = cash_ceiling
-            units = notional / eff_entry
+    # No margin: cannot deploy more than available cash net of fee/slippage
+    # buffer. Zero (or negative) cash means zero budget - it must NEVER mean
+    # "uncapped": that exact bug sized full positions after earlier entries in
+    # the same batch had consumed the cash, and the broker rejected them all.
+    if available_cash <= 0:
+        return PositionSize(0.0, 0.0, effective_risk_pct, final_stop, take_profit,
+                            "no_cash")
+    cash_ceiling = available_cash / (1.0 + max(0.0, params.fee_rate)
+                                     + max(0.0, params.slippage_pct))
+    if notional > cash_ceiling:
+        notional = cash_ceiling
+        units = notional / eff_entry
 
-    if notional < params.min_position_usd:
+    if notional < effective_min_position(equity, params.min_position_usd):
         return PositionSize(0.0, notional, effective_risk_pct, final_stop, take_profit,
                             "below_min_position")
 

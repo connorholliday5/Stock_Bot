@@ -67,6 +67,56 @@ DEFAULT_TOP_N = 10
 DEFAULT_WIN_RATE = 0.5
 DEFAULT_WIN_LOSS_RATIO = 1.5
 
+# Correlation guard. Momentum rankings cluster hard by sector: when tech is
+# running, the top 20 can be a dozen tech names, so "8 positions" becomes 8
+# versions of ONE bet and the portfolio-heat cap silently understates real
+# risk. Rather than hand-maintain a sector map, gate on the actual thing that
+# hurts - return correlation computed from the price data already fetched.
+MAX_POSITION_CORRELATION = float(
+    getattr(settings, "max_position_correlation", 0.85))
+CORRELATION_LOOKBACK = 60          # trading days of daily returns
+
+
+def _returns(df: pd.DataFrame, lookback: int = CORRELATION_LOOKBACK):
+    """Trailing daily returns for correlation, or None when too short."""
+    if df is None or "close" not in getattr(df, "columns", []):
+        return None
+    close = pd.to_numeric(df["close"], errors="coerce").dropna()
+    if len(close) < lookback + 1:
+        return None
+    return close.pct_change().dropna().iloc[-lookback:]
+
+
+def correlation_with_selected(
+    symbol: str,
+    selected: list[str],
+    universe: dict,
+    lookback: int = CORRELATION_LOOKBACK,
+) -> tuple[float, Optional[str]]:
+    """Highest absolute return-correlation between `symbol` and any already
+    selected name. Returns (correlation, that symbol) or (0.0, None) when it
+    cannot be computed - unknown correlation must never block a trade."""
+    cand = _returns(universe.get(symbol), lookback)
+    if cand is None:
+        return 0.0, None
+    worst, worst_sym = 0.0, None
+    for other in selected:
+        ref = _returns(universe.get(other), lookback)
+        if ref is None:
+            continue
+        joined = pd.concat([cand, ref], axis=1, join="inner").dropna()
+        if len(joined) < max(20, lookback // 3):
+            continue
+        try:
+            corr = float(joined.iloc[:, 0].corr(joined.iloc[:, 1]))
+        except Exception:
+            continue
+        if pd.isna(corr):
+            continue
+        if abs(corr) > abs(worst):
+            worst, worst_sym = corr, other
+    return worst, worst_sym
+
 
 def _current_week_number(now: Optional[datetime] = None) -> int:
     now = now or datetime.now(UTC)
@@ -124,9 +174,15 @@ def generate_week_entries(
     win_loss_ratio: float = DEFAULT_WIN_LOSS_RATIO,
     sector_map: Optional[dict[str, str]] = None,
     max_per_sector: int = 0,
+    max_correlation: float = MAX_POSITION_CORRELATION,
+    gate_log: Optional[dict] = None,
 ) -> list[StockEntryPlan]:
     """
     Build sized, gated long entry plans from the scored universe.
+
+    max_correlation gates a candidate whose returns track an already-selected
+    name too closely (see MAX_POSITION_CORRELATION). Pass a dict as gate_log
+    to record per-symbol rejection reasons.
 
     Pass a RiskManager to enforce the monthly drawdown halt and live portfolio heat;
     omit it to size against a cold portfolio (heat 0, dedup from open_positions only).
@@ -157,13 +213,27 @@ def generate_week_entries(
     buy_signals = generate_stock_signals(scored_df, universe, top_n=top_n)
     plans: list[StockEntryPlan] = []
 
+    def _blocked(sym: str, reason: str) -> None:
+        if gate_log is not None:
+            gate_log[sym] = reason
+        logger.info("%s: entry blocked by %s", sym, reason)
+
     for event in buy_signals:
         symbol = event.ticker
         if open_count + len(plans) >= max_positions:
             logger.info("Max stock positions reached (%d) - no more entries", max_positions)
             break
         if symbol in held:
+            _blocked(symbol, "already_held")
             continue
+
+        # Correlation guard: never stack near-duplicate exposure.
+        if max_correlation and max_correlation < 1.0:
+            selected = [p.symbol for p in plans] + [h for h in held if h]
+            corr, twin = correlation_with_selected(symbol, selected, universe)
+            if twin is not None and abs(corr) > max_correlation:
+                _blocked(symbol, f"correlated_{twin}_{corr:.2f}")
+                continue
 
         # Sector exposure guard (no-op unless a sector_map is supplied).
         if sector_map and max_per_sector:
@@ -171,7 +241,7 @@ def generate_week_entries(
             current_syms = list(held) + [p.symbol for p in plans]
             ok, reason = check_group_exposure(current_syms, symbol, sector_map, max_per_sector)
             if not ok:
-                logger.info("%s: skipped by sector guard (%s)", symbol, reason)
+                _blocked(symbol, f"sector_{reason}")
                 continue
 
         entry_price = float(event.close_price)
@@ -192,8 +262,11 @@ def generate_week_entries(
             current_heat=running_heat,
         )
         if not sizing.tradable:
-            logger.info("%s: entry gated by sizing (%s)", symbol, sizing.reason)
+            _blocked(symbol, f"sizing_{sizing.reason}")
             continue
+
+        if gate_log is not None:
+            gate_log[symbol] = "ok"
 
         plans.append(StockEntryPlan(
             symbol=symbol,
@@ -295,6 +368,43 @@ def run_stock_weekly_buys(
             executed.append(result)
 
     return StockCycleResult(entries=entries, exits=[], executed=executed, persisted=persisted)
+
+
+def select_rotation_exits(
+    open_positions: list[dict],
+    ranked_df: pd.DataFrame,
+    keep_rank: int = 20,
+) -> list[dict]:
+    """ROTATION exit rule: sell only positions that fell OUT of the fresh
+    rankings; positions still inside the top `keep_rank` keep riding.
+
+    This replaces the Friday liquidate-everything rule: momentum pays over
+    weeks, and forced weekly exits amputate winners while re-entry costs
+    spread/slippage every Monday. Stops still protect every held position.
+
+    Fail-safe: with no usable ranking (scan failed), HOLD everything - the
+    stop-loss layer keeps protecting, and dumping the whole book on a data
+    glitch is the worse failure mode.
+    """
+    if ranked_df is None or len(ranked_df) == 0:
+        logger.warning("rotation: no fresh ranking available - holding all %d positions",
+                       len(open_positions))
+        return []
+    cols = list(getattr(ranked_df, "columns", []))
+    key = "ticker" if "ticker" in cols else ("symbol" if "symbol" in cols else None)
+    if key is None:
+        logger.warning("rotation: ranking has no ticker column - holding all positions")
+        return []
+    keep = set(ranked_df[key].head(max(1, int(keep_rank))))
+    exits = []
+    for pos in open_positions:
+        symbol = pos.get("ticker") or pos.get("symbol") or ""
+        if symbol not in keep:
+            exits.append(pos)
+            logger.info("rotation: %s fell out of top %d - selling", symbol, keep_rank)
+        else:
+            logger.info("rotation: %s still ranked - holding", symbol)
+    return exits
 
 
 def run_stock_weekly_sells(
