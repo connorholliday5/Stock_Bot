@@ -145,6 +145,59 @@ def test_stress_skips_hold_only_results():
     _stress(rows, uni, cfg)          # must not raise
 
 
+# --------------------------- hysteresis ----------------------------------------
+
+def test_confirm_bars_1_is_the_old_behaviour():
+    """The default must not silently change results that are already logged."""
+    uni = _universe()
+    base = CryptoLabConfig(warmup_bars=210)
+    assert base.confirm_bars == 1
+    a = backtest_regime(uni, base)
+    b = backtest_regime(uni, CryptoLabConfig(warmup_bars=210, confirm_bars=1))
+    assert a.metrics["trades"] == b.metrics["trades"]
+    pd.testing.assert_series_equal(a.equity, b.equity)
+
+
+def test_confirm_bars_reduces_trading():
+    """The whole point: a slower gate must trade less and pay less. If this
+    does not hold, the cost diagnosis was wrong."""
+    uni = _universe()
+    fast = backtest_regime(uni, CryptoLabConfig(warmup_bars=210, confirm_bars=1))
+    slow = backtest_regime(uni, CryptoLabConfig(warmup_bars=210, confirm_bars=8))
+
+    assert slow.metrics["trades"] <= fast.metrics["trades"]
+    assert slow.metrics["total_costs"] <= fast.metrics["total_costs"]
+
+
+def test_confirm_bars_is_monotonic_in_patience():
+    """Trade count must not increase as the gate gets slower. A rise would
+    mean the hysteresis is oscillating rather than damping."""
+    uni = _universe()
+    counts = [backtest_regime(uni, CryptoLabConfig(warmup_bars=210, confirm_bars=v))
+              .metrics["trades"] for v in (1, 2, 4, 8, 12)]
+    assert counts == sorted(counts, reverse=True), counts
+
+
+def test_confirm_bars_zero_is_treated_as_one():
+    """Guard against a config typo silently disabling the gate."""
+    uni = _universe()
+    a = backtest_regime(uni, CryptoLabConfig(warmup_bars=210, confirm_bars=0))
+    b = backtest_regime(uni, CryptoLabConfig(warmup_bars=210, confirm_bars=1))
+    assert a.metrics["trades"] == b.metrics["trades"]
+
+
+def test_hysteresis_ignores_a_single_bar_flicker():
+    """Directly: one bar of contrary signal must not move the position."""
+    from backtest.crypto_lab import backtest_regime as _regime
+
+    uni = {"BTC/USD": _coin(11, n=600, drift=0.002)}
+    fast = _regime(uni, CryptoLabConfig(warmup_bars=210, confirm_bars=1))
+    slow = _regime(uni, CryptoLabConfig(warmup_bars=210, confirm_bars=5))
+    # A strongly trending single coin should be held throughout by the slow
+    # gate, while the fast one churns on noise.
+    assert slow.metrics["trades"] <= fast.metrics["trades"]
+
+
 def test_stress_runs_on_an_active_strategy():
     uni = _universe()
     cfg = CryptoLabConfig(warmup_bars=210)

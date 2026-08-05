@@ -20,6 +20,67 @@ WIDE = ["BTC/USD", "ETH/USD", "SOL/USD", "LTC/USD",
         "DOGE/USD", "LINK/USD", "AVAX/USD"]
 
 
+def _confirm_sweep(spec: str, universe, cfg, btc_only, ppy: int, n_trials: int) -> None:
+    """How much of the cost drag is whipsaw?
+
+    The 2y run charged the regime gate 27% of capital in fees across 112
+    trades, while cutting drawdown roughly in half. That combination says the
+    signal is doing its job and the TRADING FREQUENCY is what loses the money.
+    Requiring the signal to hold for N bars before acting tests that directly:
+    if trades and costs fall while return improves, the diagnosis was right.
+
+    Printed as a curve, not a best pick. One good value proves nothing - a
+    real effect improves smoothly across neighbouring values, and a lone
+    spike surrounded by bad ones is the shape of a fitted parameter.
+    """
+    from dataclasses import replace
+
+    from backtest.crypto_lab import backtest_regime
+    from backtest.validate import deflated_sharpe_ratio
+
+    try:
+        values = [int(v) for v in spec.split(",") if v.strip()]
+    except ValueError:
+        print(f"\nbad --confirm-sweep value: {spec!r}")
+        return
+    if not values:
+        return
+
+    uni = btc_only or universe
+    label = "BTC-only" if btc_only else f"wide ({len(universe)})"
+    print()
+    print("=" * 95)
+    print(f"CONFIRM-BARS SWEEP on the regime gate, {label}")
+    print("A bar is 4h, so confirm=6 means the signal must hold a full day.")
+    print("-" * 95)
+    print(f"{'confirm':>8} {'return':>10} {'CAGR':>9} {'maxDD':>9} "
+          f"{'Sharpe':>8} {'DSR':>7} {'trades':>8} {'costs':>10}")
+    print("-" * 95)
+    for v in values:
+        res = backtest_regime(uni, replace(cfg, confirm_bars=v))
+        m = res.metrics
+        if not m:
+            print(f"{v:>8}  (no result)")
+            continue
+        dsr_txt = "   n/a"
+        try:
+            d = deflated_sharpe_ratio(res.equity.pct_change().dropna(),
+                                      n_trials=n_trials, periods_per_year=ppy)
+            dsr_txt = f"{d.deflated_sharpe:>6.3f}"
+        except Exception:
+            pass
+        print(f"{v:>8} {m.get('total_return_pct', 0):>9.2f}% "
+              f"{m.get('cagr_pct', 0):>8.2f}% {m.get('max_drawdown_pct', 0):>8.2f}% "
+              f"{m.get('sharpe', 0):>8.2f} {dsr_txt:>7} {m.get('trades', 0):>8} "
+              f"${m.get('total_costs', 0):>9,.0f}")
+    print("=" * 95)
+    print("Reading this: falling trades/costs with rising return means whipsaw")
+    print("was the problem. Flat or worse return means the signal itself is")
+    print("weak and slowing it down cannot save it. Either way the DSR column")
+    print("still has to clear 0.95, and picking the best row here is a new")
+    print("trial that belongs in RESEARCH_LOG.md.")
+
+
 def _stress(rows, universe, cfg) -> None:
     """Stress the best strategy that actually makes decisions.
 
@@ -44,8 +105,13 @@ def _stress(rows, universe, cfg) -> None:
     if "BTC-only" in pick:
         uni = {k: v for k, v in universe.items() if k == "BTC/USD"}
 
-    # top_n only means something when there is a universe to choose from.
-    params = ("top_n",) if key == "momentum" and len(uni) > 1 else ()
+    # Sweep whatever that strategy actually has to tune. top_n is meaningless
+    # on a single-coin universe; confirm_bars is the regime gate's only knob
+    # and the one that would ship, so it has to survive a plateau check.
+    if key == "momentum":
+        params = ("top_n",) if len(uni) > 1 else ()
+    else:
+        params = ("confirm_bars",)
     print(f"\nstressing best active strategy: {pick}")
     print_report(stress_strategy(fns[key], uni, cfg, name=pick, params=params))
 
@@ -60,6 +126,9 @@ def main() -> int:
     ap.add_argument("--top-n", type=int, default=3)
     ap.add_argument("--stress", action="store_true",
                     help="run cost/robustness stress on the best strategy")
+    ap.add_argument("--confirm-sweep", type=str, default="",
+                    help="comma-separated confirm_bars values to sweep on the "
+                         "regime gate, e.g. 1,2,3,4,6,8")
     args = ap.parse_args()
 
     from backtest.crypto_lab import (
@@ -136,6 +205,9 @@ def main() -> int:
     print("Crypto has no survivorship bias here - these coins all still trade.")
     print("NOTE: no delisted-coin history either, so a universe-wide crypto")
     print("      winter that killed alts is under-represented in this window.")
+
+    if args.confirm_sweep:
+        _confirm_sweep(args.confirm_sweep, universe, cfg, btc_only, ppy, n_trials)
 
     if args.stress:
         _stress(rows, universe, cfg)

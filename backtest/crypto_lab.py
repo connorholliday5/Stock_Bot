@@ -50,6 +50,11 @@ class CryptoLabConfig:
     rebalance_every: int = 42         # bars between momentum rebalances
     warmup_bars: int = 210            # EMA200 needs this
     benchmark: str = "BTC/USD"
+    # Bars a flipped signal must hold before the gate acts on it. 1 = act
+    # immediately, which is what the live bot does today and what cost it
+    # 27% of capital in fees over 2y: four AND-ed conditions on 4h bars each
+    # flicker near their thresholds, and every flicker is a 50bps round trip.
+    confirm_bars: int = 1
 
 
 def _finish(points, trades, costs, universe, cfg) -> BacktestResult:
@@ -114,6 +119,14 @@ def backtest_regime(universe: dict, cfg: Optional[CryptoLabConfig] = None,
     pending: Optional[set] = None
     points = []
 
+    # Hysteresis state. `confirmed` is what the gate acts on; `streak` counts
+    # how many consecutive bars the raw signal has DISAGREED with it. The
+    # confirmed state only flips once that disagreement survives confirm_bars,
+    # so a one-bar flicker never reaches the order path.
+    confirmed: dict[str, bool] = {s: False for s in syms}
+    streak: dict[str, int] = {s: 0 for s in syms}
+    confirm = max(int(cfg.confirm_bars), 1)
+
     for i in range(cfg.warmup_bars, len(dates)):
         today = dates[i]
 
@@ -158,12 +171,22 @@ def backtest_regime(universe: dict, cfg: Optional[CryptoLabConfig] = None,
             if len(hist) < cfg.warmup_bars:
                 continue
             try:
-                if (above_ema200(hist) and ema_stacked_bullish(hist)
-                        and macd_positive(hist)
-                        and classify_regime(hist) == MarketRegime.TRENDING):
-                    wanted.add(s)
+                raw = bool(above_ema200(hist) and ema_stacked_bullish(hist)
+                           and macd_positive(hist)
+                           and classify_regime(hist) == MarketRegime.TRENDING)
             except Exception:
                 continue
+
+            if raw == confirmed[s]:
+                streak[s] = 0                  # agrees with current state
+            else:
+                streak[s] += 1
+                if streak[s] >= confirm:
+                    confirmed[s] = raw
+                    streak[s] = 0
+            if confirmed[s]:
+                wanted.add(s)
+
         if wanted != set(units):
             pending = wanted
 
