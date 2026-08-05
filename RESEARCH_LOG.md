@@ -51,19 +51,55 @@ or remove.
 | 17 | 2026-07 | stock exit mode: Friday-close vs rank-based rotation | rotation kept |
 | 18 | 2026-08 | momentum 12-1 with point-in-time index membership | +121% / 5y (was +202% biased), Sharpe 0.63, DSR 0.33 vs 0.95 gate. Fails deflation. Stress gates 4/5/6 all pass — robust in shape, level indistinguishable from luck. |
 
-| 19 | 2026-08 | crypto: hold BTC (the bar the others must clear) | benchmark, not a candidate — logged because it was fitted against the same window |
-| 20 | 2026-08 | crypto: regime, BTC only | pending first gated run |
-| 21 | 2026-08 | crypto: regime, wide universe (7 coins) | pending first gated run |
-| 22 | 2026-08 | crypto: momentum top-3 | pending first gated run |
+| 19 | 2026-08 | crypto: hold BTC (the bar the others must clear) | −3.90% / 2y, Sharpe 0.06, maxDD −53.57%, $25 costs. Benchmark, not a candidate. |
+| 20 | 2026-08 | crypto: regime, BTC only | −15.79% / 2y, Sharpe −0.13, DSR 0.007. maxDD −28.05% (half of hold's) but $2,714 costs on 112 trades. Loses to hold. |
+| 21 | 2026-08 | crypto: regime, wide universe (7 coins) | −76.89% / 2y, Sharpe −0.55, DSR 0.000, $3,763 costs on 372 trades. Worst result in this log. |
+| 22 | 2026-08 | crypto: momentum top-3 | −52.63% / 2y, Sharpe −0.11, DSR 0.008, $2,937 costs on 407 trades. Loses to hold. |
 
 **Current N = 22.**
 
-Rows 19-22 are logged **before** their results, on purpose. The crypto
+Rows 19-22 were logged **before** their results, on purpose. The crypto
 strategies were written and iterated on months ago against this same history;
 counting them only once they produce a good number is precisely the bias this
 file exists to prevent. Adding them moves the noise floor up for every future
 result, including the equity ones — which is correct, because the trials were
 real whether or not anyone wrote them down.
+
+### What the crypto run settled (2026-08, 2y, 4h bars, 25bps/side)
+
+Every active crypto strategy lost to doing nothing, and the more it traded the
+worse it did:
+
+| | return | trades | costs | costs as % of capital |
+|---|---|---|---|---|
+| hold BTC | −3.90% | 1 | $25 | 0.3% |
+| regime BTC-only | −15.79% | 112 | $2,714 | 27% |
+| momentum top-3 | −52.63% | 407 | $2,937 | 29% |
+| regime wide (7) | −76.89% | 372 | $3,763 | 38% |
+
+Three findings:
+
+1. **Widening the universe is actively destructive.** BTC-only −15.79% vs the
+   7-coin universe −76.89%, same strategy. This is the question
+   `crypto_compare.py` was written to answer. `CRYPTO_BTC_ONLY=true` was
+   already the default; it is now an evidence-backed setting rather than a
+   cautious guess.
+2. **The trend filter works; the costs eat it.** Regime BTC-only cut max
+   drawdown roughly in half (−28.05% vs hold's −53.57%) — that is exactly the
+   job it was given, and it did it. But 112 trades at 25bps per side burned
+   27% of the account, which is more than the protection was worth. The signal
+   is not obviously worthless; the *trading frequency at this cost level* is.
+3. **Nothing survives deflation.** Best DSR among the active strategies is
+   0.008 against a 0.95 gate. On a 2-year window with N=22 the noise floor is
+   Sharpe 1.37, and the best raw Sharpe here is negative.
+
+Caveat worth keeping: this window was itself bad for crypto — BTC hold lost
+money with a 53.57% drawdown. These strategies have not been observed in a
+crypto bull market, so "loses to hold" is established, "has no edge ever" is
+not. The gates cannot be run on a window that has not happened yet.
+
+Stress on the best active strategy (regime BTC-only) failed gates 4 and 6:
+−36.35% at 2× costs, and removing the 5 best days takes it to −30.26%.
 
 ## The number that matters
 
